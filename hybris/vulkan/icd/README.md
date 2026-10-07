@@ -4,10 +4,14 @@ For current runtime defaults, see
 [compatibility defaults](../../../docs/compatibility-defaults.md).
 Compatibility passes no longer require opt-in environment variables.
 
-This optional library connects the glibc Khronos Vulkan loader directly to an
-Android Vulkan HAL through libhybris. It does not load Android libvulkan, modify
-dispatchable object headers, build a private layer chain or edit pNext lists.
-HAL objects already reserve the loader dispatch word; the glibc loader owns it.
+This optional library connects the glibc Khronos Vulkan loader to an Android
+Vulkan HAL through libhybris. Android's system `libvulkan` creates and destroys
+instances, initializing the platform metadata that some vendor shader compilers
+read. The desktop loader owns device dispatch; devices, queues, commands and
+desktop WSI continue through the HAL adapter. We do not fabricate Android
+private structures, rewrite dispatch headers, or build a second device layer chain.
+The platform and HAL must resolve the same unhooked physical-device query;
+an independently selected Android driver/layer is rejected instead of mixing handles.
 
 The Arlinux desktop path uses the standard glibc Vulkan loader with this ICD
 for Mali/vendor HALs, or Turnip WSI for supported Adreno devices. The replacement
@@ -17,16 +21,16 @@ PRESENT_SOCKET have also been deleted.
 No system ICD manifest is installed by this standalone library build. Baseline
 run.py stages a private manifest with --icd-hal and --vulkan-loader. The HAL override is ignored for secure execution; without an
 override the hardware module lookup selects the Vulkan HAL. The adapter and
-HAL remain resident. Full driver unloading is not implemented.
+HAL and Android instance loader remain resident. Full driver unloading is not implemented.
 
 The adapter owns an instance record containing its real HAL resolver,
 destruction entry and a process-lifetime unique generation. Records are
-allocated before HAL creation, published only on success, removed at destroy
+allocated before platform instance creation, published only on success, removed at destroy
 and freed afterward; callbacks and HAL calls run outside the list lock.
 Application allocation callbacks also cover the record when supplied.
 No dispatch header or pNext list is rewritten. Local platform WSI names are
 appended on instance extension enumeration and stripped from the HAL
-CreateInstance list; other enabled names and the original pNext chain are
+CreateInstance list passed to Android; other enabled names and the original pNext chain are
 left unchanged. Instance proc queries retain HAL scope/enable checks, then
 return those local surface entry points when the instance enabled them. GIPA
 and destruction stay in the adapter. The resolver still does not scan the ICD

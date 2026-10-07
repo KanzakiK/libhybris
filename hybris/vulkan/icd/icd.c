@@ -2,8 +2,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * glibc Vulkan loader -> Android Vulkan HAL through the hybris ABI bridge.
- * The vendor allocates ICD-compatible dispatchable objects. Only the standard
- * loader owns their dispatch headers; this adapter never rewrites them.
+ * Android owns instance initialization; the desktop loader owns device dispatch.
+ * This adapter never fabricates or rewrites either loader's private headers.
  */
 #define _GNU_SOURCE
 #define VK_NO_PROTOTYPES
@@ -27,6 +27,7 @@
 #define ICD_EXPORT __attribute__((visibility("default")))
 static pthread_once_t hal_once = PTHREAD_ONCE_INIT;
 static hwvulkan_device_t *hal;
+static PFN_vkGetInstanceProcAddr platform_instance_proc;
 
 /* HAL and common remain resident together. This is intentionally not a driver
  * unloading implementation: vendor TLS/exit callbacks can outlive a frontend. */
@@ -78,7 +79,7 @@ static void initialize_hal(void)
     }
 
     /* Android normally implements surface/swapchain operations in its loader.
-     * No Android loader is present here. Reject driver-owned WSI rather than
+     * Desktop WSI belongs to this adapter. Reject driver-owned WSI rather than
      * pretending its surface representation matches the desktop ICD contract. */
     uint32_t count = 0;
     VkResult vr = candidate->EnumerateInstanceExtensionProperties(NULL, &count, NULL);
@@ -99,6 +100,25 @@ static void initialize_hal(void)
         fprintf(stderr, "hybris ICD: HAL extension discovery failed or needs unsupported driver-owned WSI\n");
         return;
     }
+    /* Some vendor drivers inspect Android's instance dispatch metadata when
+     * compiling shaders. A HAL-created instance still contains dispatch magic:
+     * the desktop loader wraps it, rather than initializing that Android data.
+     * Use the real platform loader for the instance lifetime only. Devices and
+     * WSI continue through our desktop ICD, with no competing device loader. */
+#if __SIZEOF_POINTER__ == 8
+    const char *platform_path = "/system/lib64/libvulkan.so";
+#else
+    const char *platform_path = "/system/lib/libvulkan.so";
+#endif
+    void *platform = hybris_dlopen(platform_path, RTLD_NOW | RTLD_LOCAL);
+    PFN_vkGetInstanceProcAddr resolve = platform ?
+        (PFN_vkGetInstanceProcAddr)hybris_dlsym(platform, "vkGetInstanceProcAddr") : NULL;
+    if (!resolve || !resolve(VK_NULL_HANDLE, "vkCreateInstance")) {
+        fprintf(stderr, "hybris ICD: Android Vulkan instance loader unavailable\n");
+        return;
+    }
+    /* Retain the platform loader alongside the HAL for process lifetime. */
+    platform_instance_proc = resolve;
     hal = candidate;
 }
 
@@ -111,7 +131,7 @@ static VkResult VKAPI_CALL create_instance(const VkInstanceCreateInfo *info,
     const VkAllocationCallbacks *allocator, VkInstance *instance)
 {
     if (!ready()) return VK_ERROR_INITIALIZATION_FAILED;
-    return hybris_icd_create_instance(hal, info, allocator, instance);
+    return hybris_icd_create_instance(hal, platform_instance_proc, info, allocator, instance);
 }
 
 static VkResult VKAPI_CALL enumerate_instance_extensions(const char *layer,

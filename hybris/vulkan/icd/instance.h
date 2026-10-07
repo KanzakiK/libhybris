@@ -5,6 +5,7 @@
 #include "hwvulkan.h"
 
 VkResult hybris_icd_create_instance(hwvulkan_device_t *hal,
+    PFN_vkGetInstanceProcAddr platform,
     const VkInstanceCreateInfo *info, const VkAllocationCallbacks *allocator,
     VkInstance *instance);
 PFN_vkVoidFunction hybris_icd_instance_proc(VkInstance instance, const char *name);

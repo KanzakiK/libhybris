@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 
 /* Driver handles keep their loader-owned dispatch header untouched. */
 struct physical_state {
@@ -70,6 +71,7 @@ static void VKAPI_CALL destroy_instance(VkInstance instance,
 }
 
 VkResult hybris_icd_create_instance(hwvulkan_device_t *hal,
+    PFN_vkGetInstanceProcAddr platform,
     const VkInstanceCreateInfo *info, const VkAllocationCallbacks *allocator,
     VkInstance *instance)
 {
@@ -97,7 +99,8 @@ VkResult hybris_icd_create_instance(hwvulkan_device_t *hal,
         free_state(state);
         return prepared;
     }
-    VkResult result = hal->CreateInstance(&filtered, allocator, instance);
+    PFN_vkCreateInstance create = (PFN_vkCreateInstance)platform(VK_NULL_HANDLE, "vkCreateInstance");
+    VkResult result = create(&filtered, allocator, instance);
     hybris_icd_wsi_finish_instance(wsi_names);
     if (result != VK_SUCCESS) {
         free_state(state);
@@ -107,7 +110,18 @@ VkResult hybris_icd_create_instance(hwvulkan_device_t *hal,
     state->api_version = info->pApplicationInfo && info->pApplicationInfo->apiVersion ?
         info->pApplicationInfo->apiVersion : VK_API_VERSION_1_0;
     state->resolver = hal->GetInstanceProcAddr;
-    state->destroy = (PFN_vkDestroyInstance)state->resolver(*instance, "vkDestroyInstance");
+    state->destroy = (PFN_vkDestroyInstance)platform(*instance, "vkDestroyInstance");
+    /* Never pass a handle from an Android layer or an independently selected
+     * updatable driver to our HAL. This core query is an unhooked driver entry
+     * in Android's loader and must resolve to the same implementation. */
+    if (platform(*instance, "vkGetPhysicalDeviceProperties") !=
+        state->resolver(*instance, "vkGetPhysicalDeviceProperties")) {
+        fprintf(stderr, "hybris ICD: Android instance and configured HAL use different dispatch implementations\n");
+        state->destroy(*instance, allocator);
+        *instance = VK_NULL_HANDLE;
+        free_state(state);
+        return VK_ERROR_INCOMPATIBLE_DRIVER;
+    }
     pthread_mutex_lock(&instance_guard);
     state->next = instances;
     instances = state;

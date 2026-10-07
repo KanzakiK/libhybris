@@ -2,6 +2,33 @@
 
 Instance, physical-device and device records; allocation refusal and recovery. These tests do not establish lifetime tracking for every Vulkan resource.
 
+## Android instance initialization regression (2026-10-07)
+
+On vivo x300 (Mali-G1-Ultra MC12, driver 54.1.0), creating an instance directly
+through the HAL left its dispatch word at `HWVULKAN_DISPATCH_MAGIC`. The desktop
+loader wraps the instance; it does not initialize Android's instance metadata.
+The vendor compute-pipeline compiler dereferenced that magic value while checking
+loader state. Disabling BC or deferring decoder creation only hid the early crash.
+
+The adapter now pairs Android loader instance creation and destruction, while
+retaining HAL device dispatch and desktop WSI. No vendor offsets are encoded.
+With BC compatibility enabled and the original eager GPU decoder initialization:
+
+- `bc-images` routes GIPA, GDPA and dlsym each passed 384 readbacks across all
+  16 BC formats, two image shapes, mipmaps, copy2 and synchronization2 paths.
+- `life` passed device recreation and concurrent device lifetimes.
+- `vk-alloc` passed allocation refusal/recovery, with zero outstanding callback
+  allocations after each instance destruction.
+- `vk-init` passed four concurrent workers and 16 instance lifetimes.
+
+The BC readbacks verify GPU output against reference pixels; production BC
+decoding remains a compute shader. Validation layers were not enabled in this
+device run. Steam's Vulkan driver query and CEF GPU initialization also passed;
+this does not establish game compatibility or complete Steam UI presentation.
+
+The older no-Android-loader mapping observations below describe historical runs,
+not the current adapter architecture.
+
 ## Current shared-layer diagnostics (2026-09-09)
 
 `icd-vk-init` and `icd-life` now use `HYBRIS_VULKAN_TRACE=1` through the same
