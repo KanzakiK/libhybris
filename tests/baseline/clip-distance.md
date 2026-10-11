@@ -23,8 +23,12 @@ validation errors or live custom allocations: direct/member-decorated outputs,
 points, lines, triangles and combined Clip/CullDistance. These used formally
 built isolated layer SHA-256
 `15c33e9b2365a74aa9c442606d2cd3a46a52429cdb4e1485d2055effe65ac11c`.
-APK/game acceptance is separate and remains pending. Earlier sections below
-record development history, not the current feature-exposure policy.
+An APK containing the same formally built layer has also run Hell Clock on
+x300 with empty Steam launch options: characters and scenery render correctly,
+movement works, and shooting enemies advances the attack tutorial to the
+interaction tutorial. This is limited gameplay evidence, not a full game or
+cross-device regression. Redmi regression remains pending. Earlier sections
+below record development history, not the current feature-exposure policy.
 
 ## Geometry-stage feasibility for culling and edge output (2026-10-11)
 
