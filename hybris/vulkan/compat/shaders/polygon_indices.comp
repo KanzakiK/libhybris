@@ -1,0 +1,79 @@
+// SPDX-License-Identifier: Apache-2.0
+#version 450
+// Ordered triangle-list conversion. Clipping and GS/TES are not implemented:
+// unsupported geometry selects a whole filled draw, never partial conversion.
+// Algorithm reference: zenithblue-oss/panvk-kbase-android, csf-v11/025.
+layout(local_size_x=1) in;
+// The producer packs each output field into a 16-byte slot. Position is slot
+// zero; the number/type of remaining fields belongs to the application.
+layout(set=0,binding=0,std430) readonly buffer Records { vec4 slots[]; } records;
+layout(set=0,binding=1,std430) readonly buffer Source { uint indices[]; } source;
+layout(set=0,binding=2,std430) buffer Generated { uint indices[]; } generated;
+layout(set=0,binding=3,std430) buffer Draw {
+    uint indexCount, instanceCount, firstIndex;
+    int vertexOffset;
+    uint firstInstance;
+    uint filledIndexCount, filledInstanceCount, filledFirstIndex;
+    int filledVertexOffset;
+    uint filledFirstInstance;
+} draw;
+layout(push_constant) uniform Params {
+    uint triangleCount, mode, cullMode, frontCCW;
+    uint invertedViewport, recordCount, capacity, recordStride;
+    uint filledIndexCount, filledInstanceCount, filledFirstIndex;
+    int filledVertexOffset;
+    uint filledFirstInstance;
+} params;
+void filledFallback() {draw.filledIndexCount=params.filledIndexCount;}
+void main() {
+    draw.indexCount=0; draw.instanceCount=1; draw.firstIndex=0;
+    draw.vertexOffset=0; draw.firstInstance=0;
+    draw.filledIndexCount=0; draw.filledInstanceCount=params.filledInstanceCount;
+    draw.filledFirstIndex=params.filledFirstIndex; draw.filledVertexOffset=params.filledVertexOffset;
+    draw.filledFirstInstance=params.filledFirstInstance;
+    uint per=params.mode==1 ? 6u : 3u;
+    // Conservative whole-draw admission. Never render a truncated prefix.
+    // A second indirect command selects the original filled draw on overflow.
+    if (params.triangleCount>min(params.capacity,uint(generated.indices.length()))/per ||
+        params.triangleCount>uint(source.indices.length())/3u || params.recordStride==0 ||
+        params.recordCount>uint(records.slots.length())/params.recordStride) {
+        filledFallback();
+        return;
+    }
+    // Admission must precede all generated writes. Clipping a triangle can
+    // introduce additional polygon edges; emitting its original three edges
+    // is not equivalent. Keep the entire original filled draw instead.
+    for (uint i=0; i<params.triangleCount*3u; ++i) {
+        uint v=source.indices[i];
+        if (v>=params.recordCount) {filledFallback();return;}
+        vec4 p=records.slots[v*params.recordStride];
+        if (any(isnan(p)) || any(isinf(p)) || p.w<=0.0 ||
+            abs(p.x)>p.w || abs(p.y)>p.w || p.z<0.0 || p.z>p.w) {
+            filledFallback();return;
+        }
+    }
+    uint count=0;
+    for (uint t=0; t<params.triangleCount; ++t) {
+        uvec3 v=uvec3(source.indices[3*t], source.indices[3*t+1], source.indices[3*t+2]);
+        vec4 a=records.slots[v.x*params.recordStride];
+        vec4 b=records.slots[v.y*params.recordStride];
+        vec4 c=records.slots[v.z*params.recordStride];
+        // Homogeneous determinant avoids division by w.
+        float area=dot(vec3(a.x,a.y,a.w),cross(vec3(b.x,b.y,b.w),vec3(c.x,c.y,c.w)));
+        bool front=params.frontCCW!=0 ? area<0.0 : area>0.0;
+        if (params.invertedViewport!=0) front=!front;
+        if ((params.cullMode & (front ? 1u : 2u))!=0) continue;
+        uint n=params.mode==1 ? 6u : 3u;
+        if (params.mode==1) {
+            generated.indices[count+0]=v.x; generated.indices[count+1]=v.y;
+            generated.indices[count+2]=v.y; generated.indices[count+3]=v.z;
+            generated.indices[count+4]=v.z; generated.indices[count+5]=v.x;
+        } else {
+            generated.indices[count+0]=v.x; generated.indices[count+1]=v.y;
+            generated.indices[count+2]=v.z;
+        }
+        count+=n;
+    }
+    draw.indexCount=count; draw.instanceCount=1; draw.firstIndex=0;
+    draw.vertexOffset=0; draw.firstInstance=0;
+}

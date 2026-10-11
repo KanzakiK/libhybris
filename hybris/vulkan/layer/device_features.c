@@ -5,6 +5,7 @@
 #include "../compat/clip_distance.h"
 #include "../compat/bc_policy.h"
 #include "../compat/scaled_vertex.h"
+#include "../compat/shader_dispatch.h"
 #include <vulkan/vk_layer.h>
 #include <stdio.h>
 #include <string.h>
@@ -39,13 +40,21 @@ VkResult hybris_device_features_prepare(VkPhysicalDevice physical,
     int stores = hybris_vertex_stores_active(physical);
     int bc = hybris_bc_complete(physical);
     int cull = hybris_cull_active(physical);
-    if (!clip && !stores && !bc && !cull) return VK_SUCCESS;
+    int polygon=hybris_shader_polygon_emulated(physical);
+    if (!clip && !stores && !bc && !cull && !polygon) return VK_SUCCESS;
     if (info->pEnabledFeatures) {
         out->features = *info->pEnabledFeatures;
         if (clip) out->features.shaderClipDistance = VK_FALSE;
         if (stores) out->features.vertexPipelineStoresAndAtomics = VK_FALSE;
         if (bc) out->features.textureCompressionBC = VK_FALSE;
-        if (cull) out->features.geometryShader = VK_TRUE;
+        if (cull) {
+            out->features.shaderCullDistance = VK_FALSE;
+            out->features.geometryShader = VK_TRUE;
+        }
+        if (polygon && out->features.fillModeNonSolid) {
+            out->features.fillModeNonSolid=VK_FALSE;
+            out->features.drawIndirectFirstInstance=VK_TRUE;
+        }
         out->info.pEnabledFeatures = &out->features;
     }
     const VkBaseInStructure *target = info->pNext;
@@ -60,7 +69,8 @@ VkResult hybris_device_features_prepare(VkPhysicalDevice physical,
     }
     const VkPhysicalDeviceFeatures *requested = &((const VkPhysicalDeviceFeatures2 *)target)->features;
     if (!(clip && requested->shaderClipDistance) && !(stores && requested->vertexPipelineStoresAndAtomics) &&
-        !(bc && requested->textureCompressionBC) && !(cull && !requested->geometryShader))
+        !(bc && requested->textureCompressionBC) && !(cull && (requested->shaderCullDistance || !requested->geometryShader)) &&
+        !(polygon && requested->fillModeNonSolid))
         return VK_SUCCESS;
 
     /* Only copy the prefix needed to replace Features2. Preserve every other
@@ -88,7 +98,14 @@ VkResult hybris_device_features_prepare(VkPhysicalDevice physical,
             if (clip) ((VkPhysicalDeviceFeatures2 *)copy)->features.shaderClipDistance = VK_FALSE;
             if (stores) ((VkPhysicalDeviceFeatures2 *)copy)->features.vertexPipelineStoresAndAtomics = VK_FALSE;
             if (bc) ((VkPhysicalDeviceFeatures2 *)copy)->features.textureCompressionBC = VK_FALSE;
-            if (cull) ((VkPhysicalDeviceFeatures2 *)copy)->features.geometryShader = VK_TRUE;
+            if (cull) {
+                ((VkPhysicalDeviceFeatures2 *)copy)->features.shaderCullDistance = VK_FALSE;
+                ((VkPhysicalDeviceFeatures2 *)copy)->features.geometryShader = VK_TRUE;
+            }
+            if (polygon && ((VkPhysicalDeviceFeatures2*)copy)->features.fillModeNonSolid) {
+                ((VkPhysicalDeviceFeatures2*)copy)->features.fillModeNonSolid=VK_FALSE;
+                ((VkPhysicalDeviceFeatures2*)copy)->features.drawIndirectFirstInstance=VK_TRUE;
+            }
             copy->pNext = (void *)out->suffix;
             break;
         }

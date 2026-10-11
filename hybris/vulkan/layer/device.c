@@ -12,6 +12,8 @@
 #include "../compat/bc_context.h"
 #include "../compat/clip_distance.h"
 #include "../compat/memory_visibility.h"
+#include "../compat/polygon_layouts.h"
+#include "../compat/polygon_pipeline.h"
 #include <vulkan/vk_layer.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -76,7 +78,10 @@ VkResult VKAPI_CALL hybris_layer_create_device(VkPhysicalDevice physical,
     if (!state) return VK_ERROR_OUT_OF_HOST_MEMORY;
     *state = (struct device_state){.device = {.resolver = resolver, .physical = physical,
         .application_policy = hybris_application_device_policy(instance.application_policy, info),
-        .track_commands = instance.application_policy != 0,
+        /* Resource lifetime/ownership is shared infrastructure, not an
+         * application-specific rendering workaround. Flush/readback changes
+         * remain gated by application_policy inside their own hooks. */
+        .track_commands = 1,
         .instance_generation = instance.generation}, .custom_allocator = allocator != NULL};
     if (allocator) state->allocator = *allocator;
     pthread_mutex_lock(&guard);
@@ -97,7 +102,7 @@ VkResult VKAPI_CALL hybris_layer_create_device(VkPhysicalDevice physical,
     state->key = hybris_layer_dispatch_key(*out);
     PFN_vkGetPhysicalDeviceFormatProperties query = (PFN_vkGetPhysicalDeviceFormatProperties)
         instance.resolver(instance.instance, "vkGetPhysicalDeviceFormatProperties");
-    result = hybris_shader_device_create(*out, physical, resolver, query, allocator);
+    result = hybris_shader_device_create(*out, physical, resolver, query, allocator, info);
     if (result == VK_SUCCESS) result = hybris_bc_attach_device(*out, physical, resolver, allocator);
     if (result != VK_SUCCESS) {
         hybris_shader_device_destroy(*out);
@@ -122,6 +127,8 @@ void VKAPI_CALL hybris_layer_destroy_device(VkDevice handle, const VkAllocationC
      * Device destruction is externally synchronized by Vulkan. */
     hybris_memory_visibility_release_device(handle);
     hybris_layer_commands_release_device(handle);
+    hybris_polygon_pipelines_release_device(handle);
+    hybris_polygon_layouts_release_device(handle);
     hybris_bc_device_remove(handle);
     hybris_vertex_stores_release_device(handle);
     hybris_shader_device_destroy(handle);
@@ -151,10 +158,10 @@ PFN_vkVoidFunction hybris_layer_device_inner_proc(VkDevice handle, const char *n
 }
 PFN_vkVoidFunction hybris_layer_device_dispatch(const char *name, int track_commands)
 {
-    PFN_vkVoidFunction compat = NULL;
+    PFN_vkVoidFunction compat = hybris_polygon_layouts_proc(name);
     if (track_commands) {
-        compat = hybris_memory_visibility_proc(name);
         if (!compat) compat = hybris_layer_commands_proc(name);
+        if (!compat) compat = hybris_memory_visibility_proc(name);
     }
     if (!compat) compat = hybris_bc_proc(name);
     if (!compat) compat = hybris_shader_cleanup_proc(name);

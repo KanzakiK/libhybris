@@ -20,6 +20,14 @@ libVkLayer_hybris_compat_la_SOURCES = layer/entry.c layer/device.c layer/physica
     compat/spirv_inout.c compat/spirv_inout.h \
     compat/clip_distance.c compat/clip_distance.h compat/spirv_clip.c \
     compat/primitive_adapter.c compat/primitive_adapter.h \
+    compat/vertex_compute.c compat/vertex_compute.h \
+    compat/vertex_resources.c compat/vertex_resources.h \
+    compat/polygon_pipeline.c compat/polygon_pipeline.h \
+    compat/polygon_indices.c compat/polygon_indices.h compat/shaders/polygon_indices.inc \
+    compat/polygon_layouts.c compat/polygon_layouts.h \
+    compat/polygon_bindings.c compat/polygon_bindings.h \
+    compat/polygon_raster.c compat/polygon_raster.h \
+    compat/polygon_buffers.c compat/polygon_buffers.h \
     compat/shader_policy.c compat/shader_policy.h \
     compat/shader_cleanup.c compat/shader_cleanup.h compat/spirv_builtins.c compat/spirv_builtins.h \
     compat/spirv_decorations.c compat/spirv_decorations.h compat/spirv_constants.c compat/spirv_constants.h compat/spirv_aggregate.c compat/spirv_aggregate.h compat/spirv_entry.c compat/spirv_entry.h compat/spirv_results.inc compat/spirv_literals.inc compat/scaled_dump.c compat/shader_dispatch.c compat/shader_dispatch.h compat/scaled_formats.c compat/scaled_formats.h compat/scaled_spirv.c compat/scaled_vertex.h
@@ -61,7 +69,7 @@ libvulkan_la_LDFLAGS = \
 
 # Optional standard-loader backend; no default ICD JSON is installed.
 libhybris_vulkan_icd_la_SOURCES = icd/icd.c icd/instance.c icd/instance.h icd/device.c icd/device.h icd/wsi.c icd/wsi.h icd/swapchain.c icd/swapchain.h icd/vk_android_native_buffer.h icd/hwvulkan.h icd/physical_commands.inc
-EXTRA_DIST = compat/shaders/bc7.glsl compat/shaders/bc6h.glsl compat/shaders/LICENSE.bcdec icd/README.md compat/shaders/bc_decode.comp compat/shaders/generate-bc.py layer/VkLayer_hybris_compat.json
+EXTRA_DIST = compat/shaders/bc7.glsl compat/shaders/bc6h.glsl compat/shaders/LICENSE.bcdec icd/README.md compat/shaders/bc_decode.comp compat/shaders/generate-bc.py compat/shaders/polygon_indices.comp compat/shaders/generate-polygon.py layer/VkLayer_hybris_compat.json
 libhybris_vulkan_icd_la_CFLAGS = $(libvulkan_la_CFLAGS) -fvisibility=hidden
 libhybris_vulkan_icd_la_CXXFLAGS = $(libvulkan_la_CXXFLAGS) -fvisibility=hidden
 libhybris_vulkan_icd_la_LDFLAGS = \

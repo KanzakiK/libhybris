@@ -89,16 +89,35 @@ static int pass_value(struct module *m, const uint32_t *w, struct id *ids,
     return ins(m, 62, 3, target, value);
 }
 
-VkResult hybris_spirv_primitive_adapter(const uint32_t *v, size_t bytes,
-    uint32_t location, uint32_t distances, int edges, const VkAllocationCallbacks *alloc,
+VkResult hybris_spirv_primitive_adapter_topology(const uint32_t *v, size_t bytes,
+    uint32_t location, uint32_t distances, VkPrimitiveTopology topology, int edges,
+    const struct hybris_primitive_faces *faces, const VkAllocationCallbacks *alloc,
     uint32_t **output, size_t *output_bytes, const char **reason)
 {
     *output = NULL; *output_bytes = 0;
     *reason = "unsupported primitive-adapter vertex interface";
+    uint32_t vertices, input_mode, output_mode;
+    switch (topology) {
+    case VK_PRIMITIVE_TOPOLOGY_POINT_LIST:
+        vertices = 1; input_mode = 19; output_mode = 27; break;
+    case VK_PRIMITIVE_TOPOLOGY_LINE_LIST:
+    case VK_PRIMITIVE_TOPOLOGY_LINE_STRIP:
+        vertices = 2; input_mode = 20; output_mode = 28; break;
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP:
+    case VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN:
+        vertices = 3; input_mode = 22; output_mode = 29; break;
+    default: return VK_ERROR_FEATURE_NOT_PRESENT;
+    }
+    if (edges && vertices != 3) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (faces && (!edges || faces->cull_mode > VK_CULL_MODE_FRONT_AND_BACK ||
+        (faces->front_face != VK_FRONT_FACE_COUNTER_CLOCKWISE &&
+         faces->front_face != VK_FRONT_FACE_CLOCKWISE))) return VK_ERROR_FEATURE_NOT_PRESENT;
     if (!v || bytes < 20 || bytes % 4 || v[0] != 0x07230203 || !v[3] ||
-        v[3] > 1000000 || !distances || distances > 8) return VK_ERROR_FEATURE_NOT_PRESENT;
+        v[3] > 1000000 || (!distances && !edges) || distances > 8) return VK_ERROR_FEATURE_NOT_PRESENT;
     size_t total = bytes / 4;
     uint32_t bound = v[3], outputs[64], count = 0, distance_var = 0;
+    uint32_t position_var = 0, position_member = UINT32_MAX;
     struct id *ids = hybris_scaled_alloc(alloc, bound * sizeof(*ids), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
     if (!ids) return VK_ERROR_OUT_OF_HOST_MEMORY;
     memset(ids, 0, bound * sizeof(*ids));
@@ -142,7 +161,11 @@ VkResult hybris_spirv_primitive_adapter(const uint32_t *v, size_t bytes,
             if (p[2] != 2 && p[2] != 11 && p[2] != 13 && p[2] != 14 && p[2] != 16 &&
                 p[2] != 17 && p[2] != 30 && p[2] != 31 && p[2] != 32) goto done;
             if (p[2] == 11 && (n != 4 || p[3] > 3 || p[3] == 2)) goto done;
-            if (p[2] == 30 && n == 4 && p[3] == location && ids[p[1]].op == 59) {
+            if (p[2] == 11 && p[3] == 0 && ids[p[1]].op == 59) {
+                if (position_var) goto done;
+                position_var = p[1];
+            }
+            if (distances && p[2] == 30 && n == 4 && p[3] == location && ids[p[1]].op == 59) {
                 if (distance_var) goto done;
                 distance_var = p[1];
             }
@@ -150,16 +173,44 @@ VkResult hybris_spirv_primitive_adapter(const uint32_t *v, size_t bytes,
         if (op == 72 && n >= 4 && p[1] < bound && ids[p[1]].needed) {
             if (p[3] != 11 && p[3] != 13 && p[3] != 14 && p[3] != 16 && p[3] != 17 && p[3] != 30 && p[3] != 31) goto done;
             if (p[3] == 11 && (n != 5 || p[4] > 3 || p[4] == 2)) goto done;
+            if (p[3] == 11 && p[4] == 0) {
+                for (uint32_t i = 0; i < count; ++i)
+                    if (v[ids[ids[outputs[i]].type].at + 3] == p[1]) {
+                        if (position_var) goto done;
+                        position_var = outputs[i]; position_member = p[2];
+                    }
+            }
         }
     }
-    if (!distance_var) goto done;
-    uint32_t array = v[ids[ids[distance_var].type].at + 3];
-    if (array >= bound || ids[array].op != 28) goto done;
-    const uint32_t *arr = v + ids[array].at;
-    uint32_t float_type = arr[2], length = arr[3];
-    if (float_type >= bound || ids[float_type].op != 22 || v[ids[float_type].at + 2] != 32 ||
-        length >= bound || ids[length].op != 43 || (v[ids[length].at] >> 16) != 4 ||
-        v[ids[length].at + 3] != distances) goto done;
+    uint32_t float_type = 0;
+    if (distances) {
+        if (!distance_var) goto done;
+        uint32_t array = v[ids[ids[distance_var].type].at + 3];
+        if (array >= bound || ids[array].op != 28) goto done;
+        const uint32_t *arr = v + ids[array].at;
+        uint32_t length = arr[3];
+        float_type = arr[2];
+        if (float_type >= bound || ids[float_type].op != 22 || v[ids[float_type].at + 2] != 32 ||
+            length >= bound || ids[length].op != 43 || (v[ids[length].at] >> 16) != 4 ||
+            v[ids[length].at + 3] != distances) goto done;
+    } else {
+        /* Edge output must also work for ordinary vertex shaders, without
+         * manufacturing a CullDistance varying or enabling that feature. */
+        for (uint32_t type = 1; type < bound; ++type)
+            if (ids[type].needed && ids[type].op == 22 && v[ids[type].at + 2] == 32) {
+                float_type = type; break;
+            }
+        if (!float_type) goto done;
+    }
+    if (faces && faces->cull_mode && faces->cull_mode != VK_CULL_MODE_FRONT_AND_BACK) {
+        if (!position_var) goto done;
+        uint32_t type = v[ids[ids[position_var].type].at + 3];
+        if (position_member != UINT32_MAX) {
+            if (ids[type].op != 30 || position_member >= (v[ids[type].at] >> 16) - 2) goto done;
+            type = v[ids[type].at + 2 + position_member];
+        }
+        if (ids[type].op != 23 || v[ids[type].at + 2] != float_type || v[ids[type].at + 3] != 4) goto done;
+    }
     uint32_t void_type = m.next++, bool_type = m.next++, uint_type = m.next++;
     int new_uint = 1;
     for (uint32_t id = 1; id < bound; ++id)
@@ -169,6 +220,7 @@ VkResult hybris_spirv_primitive_adapter(const uint32_t *v, size_t bytes,
     uint32_t function_type = m.next++, fn = m.next++, label = m.next++;
     uint32_t constants[64]; for (unsigned i = 0; i < 64; ++i) constants[i] = m.next++;
     uint32_t three = m.next++, zero = m.next++, false_id = m.next++, float_ptr = m.next++;
+    uint32_t true_id = m.next++;
     for (uint32_t type = 1; type < bound; ++type) {
         if (!ids[type].needed || ids[type].op < 20 || ids[type].op > 30) continue;
         const uint32_t *p = v + ids[type].at;
@@ -192,10 +244,10 @@ VkResult hybris_spirv_primitive_adapter(const uint32_t *v, size_t bytes,
     uint32_t entry[133] = {(uint32_t)((5 + count * 2) << 16) | 15, 3, fn, 0x6e69616d, 0};
     for (uint32_t i = 0; i < count; ++i) { entry[5 + i * 2] = outputs[i]; entry[6 + i * 2] = ids[outputs[i]].input; }
     COPY(entry, 5 + count * 2);
-    EMIT(16, 3, fn, 22u); /* InputTriangles */
+    EMIT(16, 3, fn, input_mode);
     EMIT(16, 4, fn, 0u, 1u); /* Invocations */
-    EMIT(16, 3, fn, edges ? 28u : 29u); /* OutputLineStrip/TriangleStrip */
-    EMIT(16, 4, fn, 26u, edges ? 6u : 3u); /* OutputVertices */
+    EMIT(16, 3, fn, edges ? 28u : output_mode);
+    EMIT(16, 4, fn, 26u, edges ? 6u : vertices); /* OutputVertices */
     for (size_t at = 5; at < total; at += v[at] >> 16) {
         const uint32_t *p = v + at; unsigned n = p[0] >> 16, op = p[0] & 65535;
         if ((op == 71 || op == 72) && p[1] < bound && ids[p[1]].needed) {
@@ -217,8 +269,9 @@ VkResult hybris_spirv_primitive_adapter(const uint32_t *v, size_t bytes,
     if (new_uint) EMIT(21, 4, uint_type, 32u, 0u);
     EMIT(33, 3, function_type, void_type);
     for (unsigned i = 0; i < 64; ++i) EMIT(43, 4, uint_type, constants[i], i);
-    EMIT(43, 4, uint_type, three, 3u); EMIT(43, 4, float_type, zero, 0u);
+    EMIT(43, 4, uint_type, three, vertices); EMIT(43, 4, float_type, zero, 0u);
     EMIT(42, 3, bool_type, false_id); EMIT(32, 4, float_ptr, 1u, float_type);
+    EMIT(41, 3, bool_type, true_id);
     for (size_t at = 5; at < total; at += v[at] >> 16) {
         const uint32_t *p = v + at; unsigned n = p[0] >> 16, op = p[0] & 65535;
         if ((op == 24 || op == 28 || op == 30) && ids[p[1]].in_type && ids[p[1]].in_type != p[1]) {
@@ -244,23 +297,64 @@ VkResult hybris_spirv_primitive_adapter(const uint32_t *v, size_t bytes,
     }
     EMIT(54, 5, void_type, fn, 0u, function_type); EMIT(248, 2, label);
     uint32_t discard = false_id;
+    if (faces && faces->cull_mode == VK_CULL_MODE_FRONT_AND_BACK) discard = true_id;
+    else if (faces && faces->cull_mode) {
+        uint32_t xy[3][2];
+        for (uint32_t vert = 0; vert < vertices; ++vert) {
+            uint32_t components[3];
+            for (uint32_t c = 0; c < 3; ++c) {
+                uint32_t ptr = m.next++; components[c] = m.next++;
+                uint32_t component = c == 2 ? 3 : c;
+                if (position_member == UINT32_MAX)
+                    EMIT(65, 6, float_ptr, ptr, ids[position_var].input, constants[vert], constants[component]);
+                else
+                    EMIT(65, 7, float_ptr, ptr, ids[position_var].input, constants[vert], constants[position_member], constants[component]);
+                EMIT(61, 4, float_type, components[c], ptr);
+            }
+            for (uint32_t c = 0; c < 2; ++c) {
+                xy[vert][c] = m.next++;
+                EMIT(136, 5, float_type, xy[vert][c], components[c], components[2]);
+            }
+        }
+        uint32_t delta[2][2];
+        for (uint32_t vert = 0; vert < 2; ++vert) for (uint32_t c = 0; c < 2; ++c) {
+            delta[vert][c] = m.next++;
+            EMIT(131, 5, float_type, delta[vert][c], xy[vert+1][c], xy[0][c]);
+        }
+        uint32_t a = m.next++, b = m.next++, area = m.next++, front = m.next++;
+        EMIT(133, 5, float_type, a, delta[0][0], delta[1][1]);
+        EMIT(133, 5, float_type, b, delta[0][1], delta[1][0]);
+        EMIT(131, 5, float_type, area, a, b);
+        /* Vulkan's framebuffer-area formula has a negative half factor.
+         * Translation/positive scale do not change orientation. Strict
+         * comparison makes zero-area triangles back-facing, as specified. */
+        int front_positive = (faces->front_face == VK_FRONT_FACE_CLOCKWISE) != !!faces->viewport_inverted;
+        EMIT(184, 5, bool_type, front, front_positive ? zero : area, front_positive ? area : zero);
+        discard = front;
+        if (faces->cull_mode == VK_CULL_MODE_BACK_BIT) {
+            discard = m.next++; EMIT(168, 4, bool_type, discard, front);
+        }
+    }
     for (uint32_t plane = 0; plane < distances; ++plane) {
         uint32_t negative[3];
-        for (uint32_t vert = 0; vert < 3; ++vert) {
+        for (uint32_t vert = 0; vert < vertices; ++vert) {
             uint32_t ptr = m.next++, value = m.next++; negative[vert] = m.next++;
             EMIT(65, 6, float_ptr, ptr, ids[distance_var].input, constants[vert], constants[plane]);
             EMIT(61, 4, float_type, value, ptr);
             EMIT(184, 5, bool_type, negative[vert], value, zero); /* FOrdLessThan */
         }
-        uint32_t pair = m.next++, all = m.next++, any = m.next++;
-        EMIT(167, 5, bool_type, pair, negative[0], negative[1]);
-        EMIT(167, 5, bool_type, all, pair, negative[2]);
+        uint32_t all = negative[0];
+        for (uint32_t vert = 1; vert < vertices; ++vert) {
+            uint32_t both = m.next++;
+            EMIT(167, 5, bool_type, both, all, negative[vert]); all = both;
+        }
+        uint32_t any = m.next++;
         EMIT(166, 5, bool_type, any, discard, all); discard = any;
     }
     uint32_t culled = m.next++, keep = m.next++;
     EMIT(247, 3, keep, 0u); EMIT(250, 4, discard, culled, keep);
     EMIT(248, 2, culled); EMIT(253, 1, 0u); EMIT(248, 2, keep);
-    for (uint32_t vert = 0; vert < (edges ? 6u : 3u); ++vert) {
+    for (uint32_t vert = 0; vert < (edges ? 6u : vertices); ++vert) {
         uint32_t source = edges ? ((vert / 2 + vert % 2) % 3) : vert;
         for (uint32_t i = 0; i < count; ++i) {
             uint32_t var = outputs[i], value_type = v[ids[ids[var].type].at + 3];
@@ -281,4 +375,14 @@ done:
     return status;
 #undef EMIT
 #undef COPY
+}
+
+VkResult hybris_spirv_primitive_adapter(const uint32_t *v, size_t bytes,
+    uint32_t location, uint32_t distances, int edges,
+    const struct hybris_primitive_faces *faces, const VkAllocationCallbacks *alloc,
+    uint32_t **output, size_t *output_bytes, const char **reason)
+{
+    return hybris_spirv_primitive_adapter_topology(v, bytes, location, distances,
+        VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, edges, faces, alloc,
+        output, output_bytes, reason);
 }

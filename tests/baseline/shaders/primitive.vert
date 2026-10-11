@@ -1,14 +1,19 @@
 #version 450
+#ifdef COMBINED_CLIP
+#define CLIP_MEMBER float gl_ClipDistance[1];
+#else
+#define CLIP_MEMBER
+#endif
 #ifdef CULL_BLOCK
-out gl_PerVertex { vec4 gl_Position; float gl_CullDistance[2]; };
+out gl_PerVertex { vec4 gl_Position; CLIP_MEMBER float gl_CullDistance[2]; };
 #define distances gl_CullDistance
 #else
-out gl_PerVertex { vec4 gl_Position; };
+out gl_PerVertex { vec4 gl_Position; CLIP_MEMBER };
 #endif
 layout(location=0) in vec4 value;
 layout(location=0) flat out vec4 color;
 // User varyings model the unsupported CullDistance output after translation.
-#ifndef CULL_BLOCK
+#if !defined(CULL_BLOCK) && !defined(NO_CULL)
 layout(location=1) out float distances[2];
 #endif
 layout(push_constant) uniform Expected { vec4 value; int mode; } expected;
@@ -21,6 +26,10 @@ void main() {
     if ((expected.mode & 256) != 0)
         gl_Position = vec4(p * 0.5 - 0.5, 0.0, 1.0);
     color = vec4(equal(value, expected.value));
+#ifdef COMBINED_CLIP
+    gl_ClipDistance[0] = gl_Position.x;
+#endif
+#ifndef NO_CULL
     distances[0] = mode == 1 ? -1.0 : 1.0;
     distances[1] = mode == 3 ? -1.0 : 1.0;
     if (mode == 2 || mode == 4) {
@@ -28,4 +37,5 @@ void main() {
         distances[1] = gl_VertexIndex == 2 ? -1.0 : 1.0;
     }
     if (mode == 5) { distances[0] = 0.0; distances[1] = 0.0; }
+#endif
 }

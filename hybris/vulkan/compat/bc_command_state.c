@@ -14,6 +14,7 @@ struct hybris_bc_saved_command {
     struct hybris_bc_saved_command *next;
     struct hybris_bc_layout *layout;
     enum saved_kind kind;
+    VkPipelineBindPoint bind_point;
     uint32_t first, count, offset_count;
     VkShaderStageFlags stages;
     /* Descriptor handles followed by uint32_t offsets, or push bytes. */
@@ -29,7 +30,7 @@ void hybris_bc_layouts_init(struct hybris_bc_layouts *layouts, VkDevice device,
     pthread_mutex_init(&layouts->guard, NULL);
 }
 
-static void release_layout(struct hybris_bc_layouts *layouts, struct hybris_bc_layout *layout)
+void hybris_bc_layout_release(struct hybris_bc_layouts *layouts, struct hybris_bc_layout *layout)
 {
     pthread_mutex_lock(&layouts->guard);
     int destroy = --layout->references == 0;
@@ -68,7 +69,7 @@ void hybris_bc_layout_remove(struct hybris_bc_layouts *layouts, VkPipelineLayout
     struct hybris_bc_layout *layout = *link;
     if (layout) *link = layout->next;
     pthread_mutex_unlock(&layouts->guard);
-    if (layout) release_layout(layouts, layout);
+    if (layout) hybris_bc_layout_release(layouts, layout);
 }
 
 void hybris_bc_layouts_finish(struct hybris_bc_layouts *layouts)
@@ -87,15 +88,19 @@ void hybris_bc_command_state_init(struct hybris_bc_command_state *state,
 
 void hybris_bc_command_state_reset(struct hybris_bc_command_state *state)
 {
+    unsigned track_graphics = state->track_graphics;
     struct hybris_bc_saved_command *saved = state->first;
     while (saved) {
         struct hybris_bc_saved_command *next = saved->next;
-        release_layout(state->layouts, saved->layout);
+        hybris_bc_layout_release(state->layouts, saved->layout);
         free(saved);
         saved = next;
     }
     hybris_bc_command_state_init(state, state->layouts);
+    state->track_graphics = track_graphics;
 }
+void hybris_bc_command_state_track_graphics(struct hybris_bc_command_state *state)
+{ state->track_graphics = 1; }
 
 static struct hybris_bc_saved_command *save(struct hybris_bc_command_state *state,
     VkPipelineLayout handle, size_t bytes)
@@ -107,17 +112,10 @@ static struct hybris_bc_saved_command *save(struct hybris_bc_command_state *stat
     }
     struct hybris_bc_saved_command *saved = calloc(1, sizeof(*saved) + bytes);
     if (!saved) { state->error = VK_ERROR_OUT_OF_HOST_MEMORY; return NULL; }
-    pthread_mutex_lock(&state->layouts->guard);
-    struct hybris_bc_layout *layout = state->layouts->head;
-    while (layout && layout->handle != handle) layout = layout->next;
-    if (layout && layout->references != SIZE_MAX) {
-        ++layout->references;
-        saved->layout = layout;
-    }
-    pthread_mutex_unlock(&state->layouts->guard);
-    if (!saved->layout) {
+    VkResult result = hybris_bc_layout_acquire(state->layouts, handle, &saved->layout);
+    if (result != VK_SUCCESS) {
         free(saved);
-        state->error = layout ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_INITIALIZATION_FAILED;
+        state->error = result;
         return NULL;
     }
     if (state->last) state->last->next = saved;
@@ -130,6 +128,8 @@ void hybris_bc_save_pipeline(struct hybris_bc_command_state *state,
     VkPipelineBindPoint bind_point, VkPipeline pipeline)
 {
     if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE) state->compute_pipeline = pipeline;
+    else if (state->track_graphics && bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS)
+        state->graphics_pipeline = pipeline;
 }
 
 void hybris_bc_save_descriptors(struct hybris_bc_command_state *state,
@@ -137,12 +137,14 @@ void hybris_bc_save_descriptors(struct hybris_bc_command_state *state,
     uint32_t count, const VkDescriptorSet *sets, uint32_t offset_count,
     const uint32_t *offsets)
 {
-    if (bind_point != VK_PIPELINE_BIND_POINT_COMPUTE || !count) return;
+    if (!count || (bind_point != VK_PIPELINE_BIND_POINT_COMPUTE &&
+        !(state->track_graphics && bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS))) return;
     uint64_t bytes = (uint64_t)count * sizeof(*sets) + (uint64_t)offset_count * sizeof(*offsets);
     if (bytes > SIZE_MAX) { state->error = VK_ERROR_OUT_OF_HOST_MEMORY; return; }
     struct hybris_bc_saved_command *saved = save(state, layout, (size_t)bytes);
     if (!saved) return;
     saved->kind = SAVED_DESCRIPTORS;
+    saved->bind_point = bind_point;
     saved->first = first_set;
     saved->count = count;
     saved->offset_count = offset_count;
@@ -165,7 +167,7 @@ void hybris_bc_save_push(struct hybris_bc_command_state *state, VkPipelineLayout
     if (size) memcpy(saved->data, values, size);
 }
 
-void hybris_bc_restore_compute(struct hybris_bc_command_state *state, VkCommandBuffer command)
+static void restore(struct hybris_bc_command_state *state, VkCommandBuffer command, VkPipelineBindPoint bind_point)
 {
     if (state->error != VK_SUCCESS) return;
     PFN_vkGetDeviceProcAddr resolver = state->layouts->resolver;
@@ -174,15 +176,61 @@ void hybris_bc_restore_compute(struct hybris_bc_command_state *state, VkCommandB
     PFN_vkCmdBindDescriptorSets descriptors =
         (PFN_vkCmdBindDescriptorSets)resolver(device, "vkCmdBindDescriptorSets");
     PFN_vkCmdPushConstants push = (PFN_vkCmdPushConstants)resolver(device, "vkCmdPushConstants");
-    if (state->compute_pipeline) pipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, state->compute_pipeline);
+    VkPipeline handle = bind_point == VK_PIPELINE_BIND_POINT_COMPUTE ? state->compute_pipeline : state->graphics_pipeline;
+    if (handle) pipeline(command, bind_point, handle);
     for (const struct hybris_bc_saved_command *saved = state->first; saved; saved = saved->next) {
         if (saved->kind == SAVED_DESCRIPTORS) {
-            descriptors(command, VK_PIPELINE_BIND_POINT_COMPUTE, saved->layout->clone,
+            if (saved->bind_point != bind_point) continue;
+            descriptors(command, bind_point, saved->layout->clone,
                 saved->first, saved->count, (const VkDescriptorSet *)saved->data,
                 saved->offset_count,
                 (const uint32_t *)(saved->data + (size_t)saved->count * sizeof(VkDescriptorSet)));
-        } else {
-            push(command, saved->layout->clone, saved->stages, saved->first, saved->count, saved->data);
         }
     }
+    /* Preserve the complete stage mask required by each layout's ranges.
+     * Restore unrelated stages first, then the stages about to execute. Some
+     * backends share push storage across bind points; replaying an unrelated
+     * layout last would overwrite the active pipeline's restored bytes. */
+    VkShaderStageFlags active = bind_point == VK_PIPELINE_BIND_POINT_COMPUTE ?
+        VK_SHADER_STAGE_COMPUTE_BIT : VK_SHADER_STAGE_ALL_GRAPHICS;
+    for (unsigned pass = 0; pass < 2; ++pass)
+        for (const struct hybris_bc_saved_command *saved = state->first; saved; saved = saved->next)
+            if (saved->kind == SAVED_PUSH && !!(saved->stages & active) == (int)pass)
+                push(command, saved->layout->clone, saved->stages, saved->first, saved->count, saved->data);
+}
+void hybris_bc_restore_compute(struct hybris_bc_command_state *state, VkCommandBuffer command)
+{ restore(state, command, VK_PIPELINE_BIND_POINT_COMPUTE); }
+void hybris_bc_restore_graphics(struct hybris_bc_command_state *state, VkCommandBuffer command)
+{ if (state->track_graphics) restore(state, command, VK_PIPELINE_BIND_POINT_GRAPHICS); }
+
+VkResult hybris_bc_layout_acquire(struct hybris_bc_layouts *layouts, VkPipelineLayout handle,
+    struct hybris_bc_layout **out)
+{
+    *out = NULL;
+    pthread_mutex_lock(&layouts->guard);
+    struct hybris_bc_layout *layout = layouts->head;
+    while (layout && layout->handle != handle) layout = layout->next;
+    VkResult result = layout ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_INITIALIZATION_FAILED;
+    if (layout && layout->references != SIZE_MAX) {
+        ++layout->references; *out = layout; result = VK_SUCCESS;
+    }
+    pthread_mutex_unlock(&layouts->guard);
+    return result;
+}
+VkResult hybris_bc_visit_graphics(const struct hybris_bc_command_state *state,
+    const struct hybris_bc_graphics_visitor *visitor)
+{
+    if (state->error != VK_SUCCESS) return state->error;
+    if (!state->track_graphics || !visitor) return VK_ERROR_FEATURE_NOT_PRESENT;
+    for (const struct hybris_bc_saved_command *s = state->first; s; s = s->next) {
+        VkResult result = VK_SUCCESS;
+        if (s->kind == SAVED_DESCRIPTORS && s->bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && visitor->descriptors)
+            result = visitor->descriptors(visitor->user, s->layout, s->first, s->count,
+                (const VkDescriptorSet *)s->data, s->offset_count,
+                (const uint32_t *)(s->data + (size_t)s->count * sizeof(VkDescriptorSet)));
+        else if (s->kind == SAVED_PUSH && (s->stages & VK_SHADER_STAGE_VERTEX_BIT) && visitor->push)
+            result = visitor->push(visitor->user, s->layout, s->stages, s->first, s->count, s->data);
+        if (result != VK_SUCCESS) return result;
+    }
+    return VK_SUCCESS;
 }

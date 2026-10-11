@@ -385,8 +385,23 @@ if standard_backend and a.selected_cases:
         'scaled-vertex-primitive-cull-validation-block',
         'scaled-vertex-primitive-lines-validation',
         'scaled-vertex-primitive-lines-validation-block',
+        'scaled-vertex-primitive-lines-validation-no-cull',
         'scaled-vertex-primitive-cull-validation-automatic',
         'scaled-vertex-primitive-cull-validation-block-automatic',
+        'scaled-vertex-primitive-cull-validation-clip-automatic',
+        'scaled-vertex-primitive-cull-validation-clip-block-automatic',
+        'scaled-vertex-primitive-cull-validation-point-input-automatic',
+        'scaled-vertex-primitive-cull-validation-point-input-block-automatic',
+        'scaled-vertex-primitive-cull-validation-line-input-automatic',
+        'scaled-vertex-primitive-cull-validation-line-input-block-automatic',
+    )
+    primitive_modes += tuple(
+        'scaled-vertex-' + route + '-' + cull + front + flip
+        for route in ('primitive-lines-validation-no-cull',
+                      'primitive-face-reference-validation-automatic-no-cull')
+        for cull in ('front', 'back', 'both')
+        for front in ('', '-cw')
+        for flip in ('', '-flip')
     )
     cases.extend(('icd', mode, 'probe-glibc') for mode in primitive_modes
                  if 'icd-' + mode in a.selected_cases)

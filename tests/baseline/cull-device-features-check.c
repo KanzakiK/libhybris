@@ -9,6 +9,7 @@ int hybris_clip_active(VkPhysicalDevice p) { (void)p; return 0; }
 int hybris_vertex_stores_active(VkPhysicalDevice p) { (void)p; return 0; }
 int hybris_bc_complete(VkPhysicalDevice p) { (void)p; return 0; }
 int hybris_cull_active(VkPhysicalDevice p) { (void)p; return active; }
+int hybris_shader_polygon_emulated(VkPhysicalDevice p) { (void)p; return 0; }
 
 int main(void)
 {
@@ -16,7 +17,10 @@ int main(void)
     for (active = 0; active < 2; ++active) {
         for (unsigned path = 0; path < 3; ++path) {
             for (unsigned requested = 0; requested < 2; ++requested) {
-                VkPhysicalDeviceFeatures features = {.geometryShader = requested, .robustBufferAccess = VK_TRUE};
+              for (unsigned requested_cull = 0; requested_cull < 2; ++requested_cull) {
+                VkPhysicalDeviceFeatures features = {.geometryShader = requested,
+                    .shaderCullDistance = requested_cull, .robustBufferAccess = VK_TRUE};
+                VkPhysicalDeviceFeatures original_features = features;
                 VkPhysicalDeviceFeatures2 f2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
                     .features = features};
                 VkPhysicalDeviceVulkan11Features prefix = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -32,6 +36,7 @@ int main(void)
                 struct hybris_device_features prepared;
                 assert(hybris_device_features_prepare(VK_NULL_HANDLE, &info, NULL, &prepared) == VK_SUCCESS);
                 assert(!memcmp(&info, &original, sizeof(info)));
+                assert(!memcmp(&features, &original_features, sizeof(features)));
                 assert(!memcmp(&f2, &original_f2, sizeof(f2)));
                 assert(!memcmp(&prefix, &original_prefix, sizeof(prefix)));
                 const VkPhysicalDeviceFeatures *out = prepared.info.pEnabledFeatures;
@@ -46,10 +51,12 @@ int main(void)
                     assert(out);
                     assert(out->geometryShader == (active || (path && requested)));
                     if (path) assert(out->robustBufferAccess);
-                    assert(!out->shaderCullDistance && !out->fillModeNonSolid);
+                    assert(out->shaderCullDistance == (path && requested_cull && !active));
+                    assert(!out->fillModeNonSolid);
                 } else assert(!out);
                 hybris_device_features_release(&prepared, NULL);
                 ++tested;
+              }
             }
         }
     }

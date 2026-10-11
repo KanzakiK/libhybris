@@ -40,6 +40,12 @@ int hybris_layer_command_device(VkCommandBuffer command, struct hybris_layer_dev
 int hybris_layer_command_allocator(VkCommandBuffer command, VkAllocationCallbacks *allocator);
 VkCommandPool hybris_layer_command_pool(VkCommandBuffer command);
 void hybris_layer_command_error(VkCommandBuffer command, VkResult error);
+/* Transfer an internal GPU resource to this recording on success only.
+ * Cleanup runs outside registry locks when Vulkan permits reset/free, never
+ * when recording ends or submission merely begins. Resource embeds its device
+ * and allocator; the destroy callback must not access the retired journal. */
+VkResult hybris_layer_command_retain(VkCommandBuffer command, void *resource,
+    void (*destroy)(void *resource));
 void hybris_layer_commands_release_device(VkDevice device);
 PFN_vkVoidFunction hybris_layer_commands_proc(const char *name);
 #endif

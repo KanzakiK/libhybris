@@ -4,6 +4,7 @@
 #include "vertex_stores.h"
 #include "scaled_formats.h"
 #include "bc_policy.h"
+#include "shader_dispatch.h"
 #include "../layer/layer.h"
 #include <string.h>
 #include <stdlib.h>
@@ -34,7 +35,8 @@ int hybris_shader_command_allowed(const char *name)
 }
 VkResult hybris_shader_prepare_device(VkPhysicalDevice physical, const VkDeviceCreateInfo *info)
 {
-    if (!hybris_shader_physical_mask(physical) && !hybris_vertex_stores_active(physical)) return VK_SUCCESS;
+    if (!hybris_shader_physical_mask(physical) && !hybris_vertex_stores_active(physical) &&
+        !hybris_shader_polygon_emulated(physical)) return VK_SUCCESS;
     for (uint32_t i = 0; i < info->enabledExtensionCount; ++i)
         if (!hybris_shader_extension_allowed(info->ppEnabledExtensionNames[i])) return VK_ERROR_EXTENSION_NOT_PRESENT;
     for (const VkBaseInStructure *node = info->pNext; node; node = node->pNext) {
@@ -55,6 +57,15 @@ VkResult hybris_shader_prepare_device(VkPhysicalDevice physical, const VkDeviceC
     }
     return VK_SUCCESS;
 }
+static void VKAPI_CALL features(VkPhysicalDevice physical,VkPhysicalDeviceFeatures *out)
+{
+    struct hybris_layer_physical context;
+    if(!hybris_layer_lookup_physical(physical,&context)) return;
+    PFN_vkGetPhysicalDeviceFeatures query=(void*)hybris_bc_policy_proc("vkGetPhysicalDeviceFeatures");
+    if(!query) query=(void*)context.resolver(context.instance,"vkGetPhysicalDeviceFeatures");
+    query(physical,out);
+    if(hybris_shader_polygon_emulated(physical)) out->fillModeNonSolid=VK_TRUE;
+}
 static void features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *out, const char *name)
 {
     struct hybris_layer_physical context;
@@ -64,7 +75,9 @@ static void features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *out,
     PFN_vkGetPhysicalDeviceFeatures2 query = (PFN_vkGetPhysicalDeviceFeatures2)hybris_bc_policy_proc(name);
     if (!query) query = (PFN_vkGetPhysicalDeviceFeatures2)context.resolver(context.instance, name);
     query(physical, out);
-    if (!hybris_shader_physical_mask(physical) && !hybris_vertex_stores_active(physical)) return;
+    int polygon=hybris_shader_polygon_emulated(physical);
+    if(polygon) out->features.fillModeNonSolid=VK_TRUE;
+    if (!hybris_shader_physical_mask(physical) && !hybris_vertex_stores_active(physical) && !polygon) return;
     for (VkBaseOutStructure *node = out->pNext; node; node = node->pNext) {
         switch (node->sType) {
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT:
@@ -126,6 +139,7 @@ static void VKAPI_CALL properties2_khr(VkPhysicalDevice physical, VkPhysicalDevi
 PFN_vkVoidFunction hybris_shader_policy_proc(const char *name)
 {
     /* Vertex-store discard conversion also requires complete static pipelines. */
+    if (!strcmp(name, "vkGetPhysicalDeviceFeatures")) return (PFN_vkVoidFunction)features;
     if (!strcmp(name, "vkGetPhysicalDeviceProperties2")) return (PFN_vkVoidFunction)properties2_core;
     if (!strcmp(name, "vkGetPhysicalDeviceProperties2KHR")) return (PFN_vkVoidFunction)properties2_khr;
     if (!strcmp(name, "vkGetPhysicalDeviceFeatures2")) return (PFN_vkVoidFunction)features2_core;

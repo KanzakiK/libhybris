@@ -13,6 +13,9 @@
 #include "primitive_adapter.h"
 #include "shader_policy.h"
 #include "vertex_stores.h"
+#include "polygon_pipeline.h"
+#include "bc_context.h"
+#include "../layer/layer.h"
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -33,12 +36,15 @@ struct shader_device {
     PFN_vkCreateShaderModule create_shader;
     PFN_vkDestroyShaderModule destroy_shader;
     PFN_vkCreateGraphicsPipelines create_pipelines;
+    PFN_vkDestroyPipeline destroy_pipeline;
+    PFN_vkGetDeviceProcAddr resolver;
     unsigned mask;
     int point_size;
     int inout;
     int clip;
     int cull;
     int vertex_stores;
+    int polygon;
     VkAllocationCallbacks allocator;
     int custom;
     struct shader *shaders;
@@ -64,11 +70,26 @@ int hybris_shader_device_proc_allowed(VkDevice handle, const char *name)
 {
     if (hybris_shader_command_allowed(name)) return 1;
     struct shader_device *device = find_device(handle);
-    return !device || (!device->mask && !device->vertex_stores);
+    return !device || (!device->mask && !device->vertex_stores && !device->polygon);
+}
+int hybris_shader_polygon_active(VkDevice handle)
+{
+    struct shader_device *device=find_device(handle);
+    return device && device->polygon;
+}
+int hybris_shader_polygon_emulated(VkPhysicalDevice physical)
+{
+    struct hybris_layer_physical owner;
+    if(!hybris_shader_enabled() || !hybris_layer_lookup_physical(physical,&owner)) return 0;
+    PFN_vkGetPhysicalDeviceFeatures query=(void*)owner.resolver(owner.instance,"vkGetPhysicalDeviceFeatures");
+    VkPhysicalDeviceFeatures native={0};
+    if(!query) return 0;
+    query(physical,&native);
+    return !native.fillModeNonSolid && native.drawIndirectFirstInstance;
 }
 VkResult hybris_shader_device_create(VkDevice handle, VkPhysicalDevice physical,
     PFN_vkGetDeviceProcAddr resolver, PFN_vkGetPhysicalDeviceFormatProperties query,
-    const VkAllocationCallbacks *allocator)
+    const VkAllocationCallbacks *allocator,const VkDeviceCreateInfo *requested)
 {
     if (!hybris_shader_enabled()) return VK_SUCCESS;
     struct shader_device *device = hybris_scaled_alloc(allocator, sizeof(*device), VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
@@ -81,6 +102,13 @@ VkResult hybris_shader_device_create(VkDevice handle, VkPhysicalDevice physical,
         (PFN_vkCreateShaderModule)resolver(handle, "vkCreateShaderModule");
     device->destroy_shader = (PFN_vkDestroyShaderModule)resolver(handle, "vkDestroyShaderModule");
     device->create_pipelines = (PFN_vkCreateGraphicsPipelines)resolver(handle, "vkCreateGraphicsPipelines");
+    device->destroy_pipeline = (PFN_vkDestroyPipeline)resolver(handle, "vkDestroyPipeline");
+    device->resolver = resolver;
+    VkBool32 polygon_requested=requested->pEnabledFeatures ? requested->pEnabledFeatures->fillModeNonSolid : VK_FALSE;
+    for(const VkBaseInStructure *node=requested->pNext;node;node=node->pNext)
+        if(node->sType==VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
+            polygon_requested=((const VkPhysicalDeviceFeatures2*)node)->features.fillModeNonSolid;
+    device->polygon=polygon_requested && hybris_shader_polygon_emulated(physical);
     device->mask = hybris_scaled_mask(handle, physical, query);
     device->point_size = hybris_point_size_enabled();
     device->inout = hybris_inout_enabled();
@@ -121,7 +149,7 @@ static VkResult VKAPI_CALL create_shader(VkDevice handle, const VkShaderModuleCr
     struct shader_device *device = find_device(handle);
     if (!device) return VK_ERROR_INITIALIZATION_FAILED;
     if (!device->mask && !device->point_size && !device->inout &&
-        !device->clip && !device->cull && !device->vertex_stores)
+        !device->clip && !device->cull && !device->vertex_stores && !device->polygon)
         return device->create_shader(handle, info, allocator, module);
     struct shader *shader = hybris_scaled_alloc(allocator, sizeof(*shader), VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
     if (!shader) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -149,11 +177,29 @@ static VkResult VKAPI_CALL create_shader(VkDevice handle, const VkShaderModuleCr
         created.pCode = cleaned;
         created.codeSize = cleaned_size;
     }
+    /* Module creation is validated independently of pipeline creation. Keep
+     * the original for joint VS/FS planning, but translate active ClipDistance
+     * before submitting the placeholder module to an unsupported driver. */
+    uint32_t *clip_extracted = NULL;
+    if (device->clip && !info->pNext) {
+        uint32_t location = 0, count = 0;
+        result = hybris_spirv_clip_plan(created.pCode, created.codeSize, NULL, 0, &location, &count);
+        if (result == VK_SUCCESS && count) {
+            size_t size = 0;
+            unsigned rewritten = 0;
+            result = hybris_spirv_clip_vertex(created.pCode, created.codeSize, location,
+                allocator, &clip_extracted, &size, &rewritten);
+            if (result == VK_SUCCESS && clip_extracted) {
+                created.pCode = clip_extracted;
+                created.codeSize = size;
+            }
+        }
+    }
     /* Capture the original interface, but never send unsupported CullDistance
      * to the HAL. The placeholder's location is replanned with the fragment
      * interface at pipeline creation; it is not an application-visible shader. */
     uint32_t *extracted = NULL;
-    if (device->cull && !info->pNext) {
+    if (result == VK_SUCCESS && device->cull && !info->pNext) {
         uint32_t location = 0, count = 0;
         result = hybris_spirv_cull_plan(created.pCode, created.codeSize, NULL, 0, &location, &count);
         if (result == VK_SUCCESS && count) {
@@ -169,12 +215,14 @@ static VkResult VKAPI_CALL create_shader(VkDevice handle, const VkShaderModuleCr
     }
     if (result != VK_SUCCESS) {
         hybris_scaled_free(allocator, extracted);
+        hybris_scaled_free(allocator, clip_extracted);
         hybris_scaled_free(allocator, cleaned);
         free_shader(shader);
         return result;
     }
     result = device->create_shader(handle, &created, allocator, module);
     hybris_scaled_free(allocator, extracted);
+    hybris_scaled_free(allocator, clip_extracted);
     hybris_scaled_free(allocator, cleaned);
     if (result != VK_SUCCESS) { free_shader(shader); return result; }
     shader->handle = *module;
@@ -281,6 +329,15 @@ static VkResult convert_pipeline(struct shader_device *device, VkGraphicsPipelin
     struct pipeline_copy *copy, const VkAllocationCallbacks *allocator, const char **reason)
 {
     *reason = "unsupported pipeline state for experimental scaled conversion";
+    /* Filled is the complete fallback for unsupported/overcapacity polygon
+     * conversion. Do not submit LINE/POINT to a native driver lacking them.
+     * Admission failure keeps the whole filled draw, never a partial prefix. */
+    if (device->polygon && info->pRasterizationState &&
+        info->pRasterizationState->polygonMode != VK_POLYGON_MODE_FILL) {
+        copy->raster = *info->pRasterizationState;
+        copy->raster.polygonMode = VK_POLYGON_MODE_FILL;
+        info->pRasterizationState = &copy->raster;
+    }
     /* These paths can ignore pVertexInputState entirely. Check them before
      * dereferencing it; dynamic input would also require command-time shader
      * variants, which this experimental pipeline-only fallback cannot supply. */
@@ -312,10 +369,13 @@ static VkResult convert_pipeline(struct shader_device *device, VkGraphicsPipelin
                 return VK_ERROR_FEATURE_NOT_PRESENT;
             }
             if (!info->pInputAssemblyState ||
-                (info->pInputAssemblyState->topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST &&
+                (info->pInputAssemblyState->topology != VK_PRIMITIVE_TOPOLOGY_POINT_LIST &&
+                 info->pInputAssemblyState->topology != VK_PRIMITIVE_TOPOLOGY_LINE_LIST &&
+                 info->pInputAssemblyState->topology != VK_PRIMITIVE_TOPOLOGY_LINE_STRIP &&
+                 info->pInputAssemblyState->topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST &&
                  info->pInputAssemblyState->topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP &&
                  info->pInputAssemblyState->topology != VK_PRIMITIVE_TOPOLOGY_TRIANGLE_FAN)) {
-                *reason = "CullDistance adapter currently requires triangle topology";
+                *reason = "CullDistance adapter does not support adjacency or patch topology";
                 return VK_ERROR_FEATURE_NOT_PRESENT;
             }
             for (uint32_t s = 0; s < info->stageCount; ++s)
@@ -541,8 +601,9 @@ static VkResult convert_pipeline(struct shader_device *device, VkGraphicsPipelin
                     &extracted, &extracted_size, &made);
             if (result == VK_SUCCESS && !made) result = VK_ERROR_FEATURE_NOT_PRESENT;
             if (result == VK_SUCCESS)
-                result = hybris_spirv_primitive_adapter(extracted, extracted_size,
-                    cull_location, cull_count, 0, allocator, &geometry, &geometry_size, reason);
+                result = hybris_spirv_primitive_adapter_topology(extracted, extracted_size,
+                    cull_location, cull_count, info->pInputAssemblyState->topology,
+                    0, NULL, allocator, &geometry, &geometry_size, reason);
             uint32_t slot = info->stageCount;
             if (result == VK_SUCCESS) {
                 VkShaderModuleCreateInfo module = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -621,6 +682,58 @@ done:
     hybris_scaled_free(allocator, attrs);
     return result;
 }
+static VkResult attach_polygon(struct shader_device *device,
+    const VkGraphicsPipelineCreateInfo *original,const VkGraphicsPipelineCreateInfo *changed,
+    const VkAllocationCallbacks *allocator,VkPipeline *handle)
+{
+    if (!device->polygon || !original->pRasterizationState ||
+        original->pRasterizationState->polygonMode == VK_POLYGON_MODE_FILL) return VK_SUCCESS;
+    struct shader *vertex = NULL;
+    pthread_mutex_lock(&guard);
+    for (uint32_t i = 0; i < original->stageCount; ++i)
+        if (original->pStages[i].stage == VK_SHADER_STAGE_VERTEX_BIT) {
+            vertex = device->shaders;
+            while (vertex && vertex->handle != original->pStages[i].module) vertex = vertex->next;
+            break;
+        }
+    pthread_mutex_unlock(&guard);
+    /* Unsupported declarations/shaders use the original whole filled draw. */
+    if (!vertex || vertex->extensions) return VK_SUCCESS;
+    const struct hybris_polygon_layout *layout = hybris_polygon_layout_acquire(device->handle, original->layout);
+    if (!layout) return VK_SUCCESS;
+    struct hybris_bc_device *bc = hybris_bc_device_find(device->handle);
+    struct hybris_bc_layout *identity = NULL;
+    VkResult result = bc ? hybris_bc_layout_acquire(&bc->layouts, original->layout, &identity) : VK_ERROR_FEATURE_NOT_PRESENT;
+    struct hybris_polygon_pipeline *p = NULL;
+    if (result == VK_SUCCESS) {
+        VkGraphicsPipelineCreateInfo graphics = *changed;
+        VkPipelineRasterizationStateCreateInfo raster = *changed->pRasterizationState;
+        raster.polygonMode = original->pRasterizationState->polygonMode;
+        graphics.pRasterizationState = &raster;
+        result = hybris_polygon_pipeline_create(device->handle, device->resolver, &graphics,
+            &layout->info, layout->sets, vertex->code, vertex->size, allocator, &p);
+    }
+    if (result == VK_SUCCESS) {
+        /* The batch-created native filled handle is the application's handle.
+         * Preserve batch creation/cache semantics and own its lifetime. */
+        device->destroy_pipeline(device->handle, p->filled, allocator);
+        p->filled = *handle;
+        result = hybris_polygon_pipeline_publish(p, layout, &bc->layouts, identity);
+        if (result == VK_SUCCESS) return VK_SUCCESS;
+    }
+    if (p) { hybris_polygon_pipeline_destroy(p); *handle = VK_NULL_HANDLE; }
+    if (identity) hybris_bc_layout_release(&bc->layouts, identity);
+    hybris_polygon_layout_release(layout);
+    return result == VK_ERROR_FEATURE_NOT_PRESENT ? VK_SUCCESS : result;
+}
+static void VKAPI_CALL destroy_pipeline(VkDevice handle,VkPipeline pipeline,
+    const VkAllocationCallbacks *allocator)
+{
+    struct shader_device *device = find_device(handle);
+    if (!device) return;
+    if (!hybris_polygon_pipeline_remove(handle, pipeline))
+        device->destroy_pipeline(handle, pipeline, allocator);
+}
 static VkResult VKAPI_CALL create_pipelines(VkDevice handle, VkPipelineCache cache, uint32_t count,
     const VkGraphicsPipelineCreateInfo *infos, const VkAllocationCallbacks *allocator, VkPipeline *pipelines)
 {
@@ -680,7 +793,7 @@ inline_done:
     }
     struct shader_device *device = find_device(handle);
     if (!device) return VK_ERROR_INITIALIZATION_FAILED;
-    if (!device->mask && !device->point_size && !device->inout && !device->clip && !device->cull && !device->vertex_stores)
+    if (!device->mask && !device->point_size && !device->inout && !device->clip && !device->cull && !device->vertex_stores && !device->polygon)
         return device->create_pipelines(handle, cache, count, infos, allocator, pipelines);
     VkGraphicsPipelineCreateInfo *changed = hybris_scaled_alloc(allocator, count * sizeof(*changed), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
     struct pipeline_copy *copies = hybris_scaled_alloc(allocator, count * sizeof(*copies), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
@@ -698,6 +811,10 @@ inline_done:
         }
     }
     result = device->create_pipelines(handle, cache, count, changed, allocator, pipelines);
+    if (result == VK_SUCCESS) for (uint32_t i = 0; i < count; ++i) {
+        VkResult attached = attach_polygon(device, &infos[i], &changed[i], allocator, &pipelines[i]);
+        if (attached != VK_SUCCESS && result == VK_SUCCESS) result = attached;
+    }
 done:
     if (copies) for (uint32_t i = 0; i < count; ++i) {
         if (copies[i].temporary) for (uint32_t j = 0; j < copies[i].stage_count; ++j)
@@ -718,5 +835,6 @@ PFN_vkVoidFunction hybris_shader_proc(const char *name)
     if (!strcmp(name, "vkCreateShaderModule")) return (PFN_vkVoidFunction)create_shader;
     if (!strcmp(name, "vkDestroyShaderModule")) return (PFN_vkVoidFunction)destroy_shader;
     if (!strcmp(name, "vkCreateGraphicsPipelines")) return (PFN_vkVoidFunction)create_pipelines;
+    if (!strcmp(name, "vkDestroyPipeline")) return (PFN_vkVoidFunction)destroy_pipeline;
     return NULL;
 }

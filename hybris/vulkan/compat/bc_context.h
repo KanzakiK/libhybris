@@ -2,6 +2,7 @@
 #ifndef HYBRIS_BC_CONTEXT_H
 #define HYBRIS_BC_CONTEXT_H
 #include "bc_transfer.h"
+#include "polygon_indices.h"
 
 struct hybris_bc_command {
     VkCommandBuffer handle;
@@ -28,6 +29,7 @@ struct hybris_bc_device {
     VkPhysicalDeviceProperties properties;
     struct hybris_bc_decoder decoder;
     struct hybris_bc_layouts layouts;
+    struct hybris_polygon_indices polygon;
     unsigned format_mask, rgb_mask;
     VkAllocationCallbacks allocator;
     int custom_allocator;

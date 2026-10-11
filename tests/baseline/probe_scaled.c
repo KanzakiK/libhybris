@@ -10,13 +10,38 @@ enum { kScaledImage = 16 };
 int scaled_vertex_probe(int validate, int route, const char *mode) {
   const int primitive = strstr(mode, "primitive-") != NULL;
   const int automatic = primitive && strstr(mode, "-automatic") != NULL;
+  const int combined_clip = primitive && strstr(mode, "-clip") != NULL;
   const int lines = strstr(mode, "primitive-lines") != NULL;
+  const unsigned primitive_vertices = strstr(mode, "-point-input") ? 1 :
+    strstr(mode, "-line-input") ? 2 : 3;
+  const VkPrimitiveTopology primitive_topology = primitive_vertices == 1 ? VK_PRIMITIVE_TOPOLOGY_POINT_LIST :
+    primitive_vertices == 2 ? VK_PRIMITIVE_TOPOLOGY_LINE_LIST : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+  const int no_cull = primitive && strstr(mode, "-no-cull") != NULL;
+  const int face_reference = primitive && strstr(mode, "-face-reference") != NULL;
+  const int flipped_viewport = primitive && strstr(mode, "-flip") != NULL;
+  const struct hybris_primitive_faces faces = {
+    .cull_mode = strstr(mode, "-front") ? VK_CULL_MODE_FRONT_BIT :
+      strstr(mode, "-back") ? VK_CULL_MODE_BACK_BIT :
+      strstr(mode, "-both") ? VK_CULL_MODE_FRONT_AND_BACK : VK_CULL_MODE_NONE,
+    .front_face = strstr(mode, "-cw") ? VK_FRONT_FACE_CLOCKWISE : VK_FRONT_FACE_COUNTER_CLOCKWISE,
+    .viewport_inverted = flipped_viewport,
+  };
+  const int front_facing = (faces.front_face == VK_FRONT_FACE_CLOCKWISE) != flipped_viewport;
+  const int face_culled = (faces.cull_mode & (front_facing ? VK_CULL_MODE_FRONT_BIT : VK_CULL_MODE_BACK_BIT)) != 0;
+  static const struct scaled_shader plain_primitive_shader = {"", primitive_vertex_spv, sizeof(primitive_vertex_spv), 0, 0, 0, 0, 0};
   static const struct scaled_shader primitive_shader = {"", primitive_cull_vertex_spv, sizeof(primitive_cull_vertex_spv), 0, 0, 0, 0, 0};
   static const struct scaled_shader primitive_block_shader = {"", primitive_cull_block_vertex_spv, sizeof(primitive_cull_block_vertex_spv), 0, 0, 0, 0, 0};
+  static const struct scaled_shader primitive_clip_shader = {"", primitive_clip_cull_vertex_spv, sizeof(primitive_clip_cull_vertex_spv), 0, 0, 0, 0, 0};
+  static const struct scaled_shader primitive_clip_block_shader = {"", primitive_clip_cull_block_vertex_spv, sizeof(primitive_clip_cull_block_vertex_spv), 0, 0, 0, 0, 0};
   const struct scaled_shader *shader = shaders;
   while (!strstr(mode, shader->mode)) ++shader;
   if (primitive) shader = &primitive_shader;
   if (primitive && strstr(mode, "-block")) shader = &primitive_block_shader;
+  if (no_cull) shader = &plain_primitive_shader;
+  if (combined_clip) {
+    if (!automatic || lines) { puts("PRIMITIVE combined clip requires automatic triangle mode"); return 1; }
+    shader = strstr(mode, "-block") ? &primitive_clip_block_shader : &primitive_clip_shader;
+  }
   const int multiple = shader->multiple, aggregate = shader->aggregate, specialized = shader->specialized;
   const unsigned instance_mode = shader->instance_mode;
   const int dynamic_stride = strstr(mode, "divisor-stride") != NULL;
@@ -161,6 +186,8 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
     p_vkGetPhysicalDeviceFeatures(pd, &primitive_features);
     if (!primitive_features.geometryShader) { puts("PRIMITIVE_UNSUPPORTED geometryShader"); return 3; }
     primitive_features = (VkPhysicalDeviceFeatures){.geometryShader = automatic ? VK_FALSE : VK_TRUE};
+    primitive_features.shaderCullDistance = automatic && !no_cull;
+    primitive_features.shaderClipDistance = combined_clip ? VK_TRUE : VK_FALSE;
     dc.pEnabledFeatures = &primitive_features;
   }
   VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor_features = {0};
@@ -287,7 +314,7 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
   VkShaderModule vs, fs, gs = VK_NULL_HANDLE;
   uint32_t *primitive_code = NULL;
   uint32_t primitive_location = 0, primitive_distances = 0;
-  if (primitive && !automatic) {
+  if (primitive && !automatic && !no_cull) {
     size_t size = 0;
     unsigned rewritten = 0;
     CHECK(hybris_spirv_cull_plan(shader->code, shader->size, fs_ci.pCode, fs_ci.codeSize,
@@ -306,8 +333,8 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
     uint32_t *geometry = NULL;
     size_t geometry_size = 0;
     const char *reason = NULL;
-    CHECK(hybris_spirv_primitive_adapter(primitive_code, vs_ci.codeSize, primitive_location, primitive_distances, lines,
-      &callbacks, &geometry, &geometry_size, &reason));
+    CHECK(hybris_spirv_primitive_adapter_topology(vs_ci.pCode, vs_ci.codeSize, primitive_location, primitive_distances, primitive_topology, lines,
+      lines ? &faces : NULL, &callbacks, &geometry, &geometry_size, &reason));
     VkShaderModuleCreateInfo gs_ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
       .codeSize = geometry_size, .pCode = geometry};
     CHECK(p_vkCreateShaderModule(device, &gs_ci, &callbacks, &gs));
@@ -372,8 +399,9 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
   VkPipelineInputAssemblyStateCreateInfo ia = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-      .topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
+      .topology = primitive ? primitive_topology : VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST};
   VkViewport vp = {0, 0, (float)kScaledImage, (float)kScaledImage, 0, 1};
+  if (flipped_viewport) { vp.y = kScaledImage; vp.height = -kScaledImage; }
   VkRect2D sc = {{0, 0}, {kScaledImage, kScaledImage}};
   VkPipelineViewportStateCreateInfo vps = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
@@ -387,6 +415,7 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
       .cullMode = VK_CULL_MODE_NONE,
       .frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE,
       .lineWidth = 1};
+  if (face_reference) { rs.cullMode = faces.cull_mode; rs.frontFace = faces.front_face; }
   VkPipelineMultisampleStateCreateInfo ms = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
       .rasterizationSamples = VK_SAMPLE_COUNT_1_BIT};
@@ -561,9 +590,9 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
         } else p_vkCmdBindVertexBuffers(cb, 0, 1, &ibo, &offset);
         p_vkCmdPushConstants(cb, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, primitive ? 16 : push.size, expected);
         unsigned primitive_mode = phase + 3 * (round & 1);
-        unsigned primitive_push = primitive_mode | (lines ? 256u : 0u);
+        unsigned primitive_push = primitive_mode | (lines || face_reference || primitive_vertices < 3 ? 256u : 0u);
         if (primitive) p_vkCmdPushConstants(cb, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 16, 4, &primitive_push);
-        p_vkCmdDraw(cb, instance_mode ? 6 : 3, instance_mode ? 4 : 1, 0, first_instance);
+        p_vkCmdDraw(cb, instance_mode ? 6 : primitive ? primitive_vertices : 3, instance_mode ? 4 : 1, 0, first_instance);
         p_vkCmdEndRenderPass(cb);
         VkBufferImageCopy copy = {
             .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
@@ -588,8 +617,11 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
         unsigned lit = 0;
         for (unsigned pixel = 0; pixel < kScaledImage*kScaledImage; ++pixel)
         {
-          int clear_pixel = primitive && (primitive_mode == 1 || primitive_mode == 3);
-          if (primitive && lines && !clear_pixel) {
+          int clear_pixel = primitive && !no_cull && (primitive_mode == 1 || primitive_mode == 3 ||
+            (primitive_vertices < 3 && (primitive_mode == 2 || primitive_mode == 4)));
+          if ((lines || face_reference) && face_culled) clear_pixel = 1;
+          if (combined_clip && pixel % kScaledImage < kScaledImage / 2) clear_pixel = 1;
+          if (primitive && (lines || face_reference || primitive_vertices < 3) && !clear_pixel) {
             clear_pixel = pixels[pixel*4+3] == 0;
             if (!clear_pixel) ++lit;
           }
@@ -601,8 +633,12 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
             if (pixels[pixel*4+component] != expected_byte) ++bad;
           }
         }
-        if (primitive && lines && primitive_mode != 1 && primitive_mode != 3) {
-          if (lit < 12 || lit > 40 || pixels[(5*kScaledImage+5)*4+3] != 0) ++bad;
+        if (primitive && (lines || face_reference) && !face_culled && (no_cull || (primitive_mode != 1 && primitive_mode != 3))) {
+          const unsigned interior_y = flipped_viewport ? kScaledImage - 1 - 5 : 5;
+          if (lit < 12 || lit > 40 || (lines && pixels[(interior_y*kScaledImage+5)*4+3] != 0)) ++bad;
+        }
+        if (primitive && primitive_vertices < 3 && (no_cull || primitive_mode == 0 || primitive_mode == 5)) {
+          if (primitive_vertices == 1 ? lit != 1 : lit < 6 || lit > 10) ++bad;
         }
         if (primitive) printf("PRIMITIVE case=%u mode=%u lines=%u lit=%u bad=%u\n", c, primitive_mode, lines, lit, bad);
         printf("SCALED format=%s entry=%s phase=%u expected=%g,%g,%g,%g pixel=%u,%u,%u,%u bad=%u\n",

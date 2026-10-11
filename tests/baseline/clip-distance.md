@@ -1,5 +1,31 @@
 # Clip-distance compatibility
 
+## Current CullDistance coverage (2026-10-11)
+
+Drivers without native CullDistance but with geometry shaders expose the
+compatibility feature. Device creation strips the virtual feature and enables
+the native geometry stage without changing application-owned inputs. A generated
+geometry shader discards an entire point, line or triangle when every vertex is
+negative for the same cull plane. Mixed signs and zero distances are retained.
+There is no CPU geometry or pixel readback in this implementation.
+
+Static point list, line list/strip and triangle list/strip/fan pipelines with
+plain vertex/fragment stages are supported. Adjacency, tessellation, application
+geometry stages, dynamic topology and rasterizer-discard CullDistance pipelines
+remain unsupported and fail pipeline creation rather than silently ignoring the
+cull output. This is bounded application compatibility, not a Vulkan conformance
+claim. Non-solid polygon emulation has its own complete filled-draw fallback;
+that fallback does not justify ignoring CullDistance.
+
+`build-cull.sh` checks generated SPIR-V and 24 immutable device-feature cases.
+On x300, eight automatic insertion modes passed 576 pixel readbacks, with no
+validation errors or live custom allocations: direct/member-decorated outputs,
+points, lines, triangles and combined Clip/CullDistance. These used formally
+built isolated layer SHA-256
+`15c33e9b2365a74aa9c442606d2cd3a46a52429cdb4e1485d2055effe65ac11c`.
+APK/game acceptance is separate and remains pending. Earlier sections below
+record development history, not the current feature-exposure policy.
+
 ## Geometry-stage feasibility for culling and edge output (2026-10-11)
 
 The `scaled-vertex-primitive-cull-validation` and
@@ -59,11 +85,39 @@ stages, dynamic topology and rasterizer discard are not implemented. General
 core-feature exposure and game acceptance remain incomplete. These runs use
 an isolated formally built library, not a newly installed APK.
 
+The primitive adapter also accepts zero cull distances for edge output. The
+`scaled-vertex-primitive-lines-validation-no-cull` probe uses an ordinary
+Position/color vertex interface, with no cull declaration or synthetic cull
+varying. It passes 72 image readbacks on x300. The two existing direct/block
+edge modes also pass 144 readbacks, with zero mismatches, validation errors
+and live custom allocations. This tests the GPU adapter directly; automatic
+polygonMode translation and full face-culling/clipping semantics are still
+unimplemented, so fillModeNonSolid must not be advertised.
+
+An isolated native polygonMode LINE investigation does not justify changing
+the advertised feature: requesting fillModeNonSolid from the x300 backend
+returns VK_ERROR_FEATURE_NOT_PRESENT at device creation. A separate probe
+without that request produced filled triangles, not edges; that deliberately
+invalid Vulkan usage is diagnostic evidence only, not a supported path.
+
 Distance planning reserves the full location span of matrices, arrays, wide
 vectors and member-decorated interface blocks. Cull locations are replanned
 after ClipDistance extraction to avoid overlapping the two injected varyings.
-The host rewrite check covers the location spans; combined clip/cull GPU
-coverage remains pending.
+The host rewrite check covers the location spans. The automatic `-clip` and
+`-clip-block` modes now cover combined clip/cull GPU output: an active clip
+plane removes the left half of the image while the six cull configurations
+either preserve the right half or discard the entire primitive.
+
+This caught a module-creation error: active ClipDistance was translated only
+at pipeline creation, after the placeholder shader had already reached the
+driver with an unsupported capability. Module creation now translates it too,
+while retaining the original interface for joint pipeline planning. The two
+combined modes and two original automatic cull modes passed 288 readbacks on
+x300, and the twelve-format scaled regression passed 36 more. All five modes
+reported zero pixel mismatches, zero validation errors and zero live custom
+allocations using formally built layer SHA-256
+`873b8e208802712db946c8f208808180a32f11cb7c5b35466151f5e03e683382`.
+These remain isolated-library tests, not APK or game acceptance.
 
 Mali reports `shaderClipDistance=false`. Blender 4.3 `VKBackend::is_supported`
 requires that bit. The ICD does the Vortek-shaped automatic path: advertise

@@ -8,8 +8,10 @@ void hybris_scaled_format(PFN_vkGetPhysicalDeviceFormatProperties query,
     VkPhysicalDevice physical, VkFormat format, VkFormatProperties *properties);
 VkResult hybris_shader_device_create(VkDevice device, VkPhysicalDevice physical,
     PFN_vkGetDeviceProcAddr resolver, PFN_vkGetPhysicalDeviceFormatProperties query,
-    const VkAllocationCallbacks *allocator);
+    const VkAllocationCallbacks *allocator, const VkDeviceCreateInfo *requested);
 void hybris_shader_device_destroy(VkDevice device);
 PFN_vkVoidFunction hybris_shader_proc(const char *name);
 int hybris_shader_device_proc_allowed(VkDevice device, const char *name);
+int hybris_shader_polygon_active(VkDevice device);
+int hybris_shader_polygon_emulated(VkPhysicalDevice physical);
 #endif

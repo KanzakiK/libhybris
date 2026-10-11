@@ -4,7 +4,7 @@
 #include "scaled_vertex.h"
 int hybris_clip_enabled(void);
 int hybris_clip_active(VkPhysicalDevice physical);
-/* Internal triangle adapter availability; not a core CullDistance claim. */
+/* GPU whole-primitive culling using a native geometry-stage adapter. */
 int hybris_cull_active(VkPhysicalDevice physical);
 int hybris_clip_pipeline(const VkGraphicsPipelineCreateInfo *info);
 void hybris_clip_filter_features(VkPhysicalDevice physical, VkPhysicalDeviceFeatures *features);

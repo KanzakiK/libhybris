@@ -1,9 +1,12 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #define VK_NO_PROTOTYPES
 #include "bc_context.h"
+#include "shader_dispatch.h"
 #include <string.h>
 
 #define PROC(name) PFN_vk##name name = (PFN_vk##name)device->resolver(device->handle, "vk" #name)
+static int journal_enabled(const struct hybris_bc_device *device)
+{ return device->format_mask || hybris_shader_polygon_active(device->handle); }
 static VkResult VKAPI_CALL allocate_commands(VkDevice handle, const VkCommandBufferAllocateInfo *info,
     VkCommandBuffer *handles)
 {
@@ -18,6 +21,7 @@ static VkResult VKAPI_CALL allocate_commands(VkDevice handle, const VkCommandBuf
         }
         command->pool = info->commandPool;
         hybris_bc_command_state_init(&command->state, &device->layouts);
+        if(hybris_shader_polygon_active(handle)) hybris_bc_command_state_track_graphics(&command->state);
         hybris_bc_transfer_init(&command->transfer, &device->decoder, &device->memory, &device->properties.limits);
         command->next = first;
         first = command;
@@ -150,7 +154,7 @@ static VkResult VKAPI_CALL create_layout(VkDevice handle, const VkPipelineLayout
     if (!device) return VK_ERROR_INITIALIZATION_FAILED;
     PROC(CreatePipelineLayout); PROC(DestroyPipelineLayout);
     VkResult result = CreatePipelineLayout(handle, info, allocator, layout);
-    if (result != VK_SUCCESS || !device->format_mask) return result;
+    if (result != VK_SUCCESS || !journal_enabled(device)) return result;
     result = hybris_bc_layout_add(&device->layouts, *layout, info);
     if (result != VK_SUCCESS) {
         DestroyPipelineLayout(handle, *layout, allocator);
@@ -165,7 +169,7 @@ static void VKAPI_CALL destroy_layout(VkDevice handle, VkPipelineLayout layout,
     if (!device) return;
     PROC(DestroyPipelineLayout);
     DestroyPipelineLayout(handle, layout, allocator);
-    if (device->format_mask) hybris_bc_layout_remove(&device->layouts, layout);
+    if (journal_enabled(device)) hybris_bc_layout_remove(&device->layouts, layout);
 }
 static void VKAPI_CALL bind_pipeline(VkCommandBuffer handle, VkPipelineBindPoint point, VkPipeline pipeline)
 {
@@ -174,7 +178,7 @@ static void VKAPI_CALL bind_pipeline(VkCommandBuffer handle, VkPipelineBindPoint
     if (!command) return;
     PROC(CmdBindPipeline);
     CmdBindPipeline(handle, point, pipeline);
-    if (device->format_mask) hybris_bc_save_pipeline(&command->state, point, pipeline);
+    if (journal_enabled(device)) hybris_bc_save_pipeline(&command->state, point, pipeline);
 }
 static void VKAPI_CALL bind_descriptors(VkCommandBuffer handle, VkPipelineBindPoint point,
     VkPipelineLayout layout, uint32_t first, uint32_t count, const VkDescriptorSet *sets,
@@ -185,7 +189,7 @@ static void VKAPI_CALL bind_descriptors(VkCommandBuffer handle, VkPipelineBindPo
     if (!command) return;
     PROC(CmdBindDescriptorSets);
     CmdBindDescriptorSets(handle, point, layout, first, count, sets, offset_count, offsets);
-    if (device->format_mask)
+    if (journal_enabled(device))
         hybris_bc_save_descriptors(&command->state, point, layout, first, count, sets, offset_count, offsets);
 }
 static void VKAPI_CALL push_constants(VkCommandBuffer handle, VkPipelineLayout layout,
@@ -196,7 +200,7 @@ static void VKAPI_CALL push_constants(VkCommandBuffer handle, VkPipelineLayout l
     if (!command) return;
     PROC(CmdPushConstants);
     CmdPushConstants(handle, layout, stages, offset, size, values);
-    if (device->format_mask) hybris_bc_save_push(&command->state, layout, stages, offset, size, values);
+    if (journal_enabled(device)) hybris_bc_save_push(&command->state, layout, stages, offset, size, values);
 }
 /* maintenance6 entry points also change the compute state temporarily used
  * by the BC decoder. Forward the complete native command, then capture the
@@ -208,9 +212,14 @@ static void bind_descriptors2(VkCommandBuffer handle, const VkBindDescriptorSets
     if (!command) return;
     PFN_vkCmdBindDescriptorSets2KHR bind = (PFN_vkCmdBindDescriptorSets2KHR)device->resolver(device->handle, name);
     bind(handle, info);
-    if (device->format_mask && (info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)) {
+    int compute = !!(info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT);
+    int graphics = command->state.track_graphics && !!(info->stageFlags & VK_SHADER_STAGE_ALL_GRAPHICS);
+    if (journal_enabled(device) && (compute || graphics)) {
         if (!info->layout) { command->state.error = VK_ERROR_FEATURE_NOT_PRESENT; return; }
-        hybris_bc_save_descriptors(&command->state, VK_PIPELINE_BIND_POINT_COMPUTE,
+        if (compute) hybris_bc_save_descriptors(&command->state, VK_PIPELINE_BIND_POINT_COMPUTE,
+            info->layout, info->firstSet, info->descriptorSetCount, info->pDescriptorSets,
+            info->dynamicOffsetCount, info->pDynamicOffsets);
+        if (graphics) hybris_bc_save_descriptors(&command->state, VK_PIPELINE_BIND_POINT_GRAPHICS,
             info->layout, info->firstSet, info->descriptorSetCount, info->pDescriptorSets,
             info->dynamicOffsetCount, info->pDynamicOffsets);
     }
@@ -226,7 +235,7 @@ static void push_constants2(VkCommandBuffer handle, const VkPushConstantsInfoKHR
     if (!command) return;
     PFN_vkCmdPushConstants2KHR push = (PFN_vkCmdPushConstants2KHR)device->resolver(device->handle, name);
     push(handle, info);
-    if (device->format_mask) {
+    if (journal_enabled(device)) {
         if (!info->layout) { command->state.error = VK_ERROR_FEATURE_NOT_PRESENT; return; }
         hybris_bc_save_push(&command->state, info->layout, info->stageFlags,
             info->offset, info->size, info->pValues);

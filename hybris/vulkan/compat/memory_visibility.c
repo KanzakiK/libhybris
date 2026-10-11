@@ -54,6 +54,24 @@ static struct buffer *find_buffer(const struct hybris_layer_device *device, VkBu
             return b;
     return NULL;
 }
+VkResult hybris_memory_visibility_storage_buffer(const struct hybris_layer_device *device,
+    VkBuffer handle, VkDeviceSize offset, VkDeviceSize size, VkDescriptorBufferInfo *out)
+{
+    *out = (VkDescriptorBufferInfo){0};
+    VkResult result = VK_ERROR_FEATURE_NOT_PRESENT;
+    pthread_mutex_lock(&guard);
+    const struct buffer *b = find_buffer(device, handle);
+    const struct allocation *a = b ? find_memory(device, b->memory) : NULL;
+    if (!b || !(b->usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) || !a ||
+        !b->memory_generation || a->generation != b->memory_generation ||
+        b->offset > a->size || b->size > a->size - b->offset || offset >= b->size) goto done;
+    if (size == VK_WHOLE_SIZE) size = b->size - offset;
+    if (!size || size > b->size - offset) goto done;
+    *out = (VkDescriptorBufferInfo){handle, offset, size}; result = VK_SUCCESS;
+done:
+    pthread_mutex_unlock(&guard);
+    return result;
+}
 static VkResult cache_memory(VkDevice device, uint32_t count,
     const VkMappedMemoryRange *ranges, const char *name)
 {

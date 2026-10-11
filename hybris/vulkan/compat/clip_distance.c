@@ -74,6 +74,7 @@ static void VKAPI_CALL features(VkPhysicalDevice physical, VkPhysicalDeviceFeatu
     if (!query) return;
     query(physical, out);
     if (hybris_clip_active(physical)) out->shaderClipDistance = VK_TRUE;
+    if (hybris_cull_active(physical)) out->shaderCullDistance = VK_TRUE;
     if (hybris_vertex_stores_active(physical)) out->vertexPipelineStoresAndAtomics = VK_TRUE;
 }
 
@@ -83,6 +84,7 @@ static void features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *out,
     if (!query) return;
     query(physical, out);
     if (hybris_clip_active(physical)) out->features.shaderClipDistance = VK_TRUE;
+    if (hybris_cull_active(physical)) out->features.shaderCullDistance = VK_TRUE;
     if (hybris_vertex_stores_active(physical)) {
         out->features.vertexPipelineStoresAndAtomics = VK_TRUE;
         /* Preserve native transform feedback. Pipelines needing discard
@@ -98,10 +100,13 @@ static void VKAPI_CALL features2_khr(VkPhysicalDevice physical, VkPhysicalDevice
 
 static void apply_limits(VkPhysicalDevice physical, VkPhysicalDeviceLimits *limits)
 {
-    if (!hybris_clip_active(physical)) return;
-    if (limits->maxClipDistances < 8) limits->maxClipDistances = 8;
+    if (!hybris_clip_active(physical) && !hybris_cull_active(physical)) return;
+    if (hybris_clip_active(physical) && limits->maxClipDistances < 8) limits->maxClipDistances = 8;
+    if (hybris_cull_active(physical) && limits->maxCullDistances < 8) limits->maxCullDistances = 8;
     if (limits->maxCombinedClipAndCullDistances < limits->maxClipDistances)
         limits->maxCombinedClipAndCullDistances = limits->maxClipDistances;
+    if (limits->maxCombinedClipAndCullDistances < limits->maxCullDistances)
+        limits->maxCombinedClipAndCullDistances = limits->maxCullDistances;
 }
 
 static void VKAPI_CALL properties(VkPhysicalDevice physical, VkPhysicalDeviceProperties *out)

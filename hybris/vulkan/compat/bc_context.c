@@ -107,6 +107,7 @@ void hybris_bc_device_remove(VkDevice handle)
         device->images = next;
     }
     hybris_bc_layouts_finish(&device->layouts);
+    if(device->polygon.device) hybris_polygon_indices_destroy(&device->polygon,NULL);
     if (device->decoder.device) hybris_bc_decoder_destroy(&device->decoder, NULL);
     pthread_mutex_destroy(&device->guard);
     hybris_bc_free(device, device);

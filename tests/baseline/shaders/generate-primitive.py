@@ -9,9 +9,11 @@ here = Path(__file__).resolve().parent
 with tempfile.TemporaryDirectory(prefix='hybris-primitive-') as temporary:
     parts = []
     for name, source, options in (
-        ('vertex', 'primitive.vert', []),
+        ('vertex', 'primitive.vert', ['-DNO_CULL=1']),
         ('cull_vertex', 'primitive.vert', []),
         ('cull_block_vertex', 'primitive.vert', ['-DCULL_BLOCK=1']),
+        ('clip_cull_vertex', 'primitive.vert', ['-DCOMBINED_CLIP=1']),
+        ('clip_cull_block_vertex', 'primitive.vert', ['-DCOMBINED_CLIP=1', '-DCULL_BLOCK=1']),
         ('cull', 'primitive.geom', []),
         ('lines', 'primitive.geom', ['-DPRIMITIVE_LINES=1']),
     ):
@@ -19,7 +21,7 @@ with tempfile.TemporaryDirectory(prefix='hybris-primitive-') as temporary:
         subprocess.run(['glslangValidator', '-V', *options, str(here/source), '-o', str(binary)], check=True)
         data = binary.read_bytes()
         words = list(struct.unpack('<' + 'I' * (len(data)//4), data))
-        if name == 'cull_vertex':
+        if name in ('cull_vertex', 'clip_cull_vertex'):
             at, changed = 5, 0
             while at < len(words):
                 count, op = words[at] >> 16, words[at] & 65535
