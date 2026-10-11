@@ -23,6 +23,18 @@ int hybris_clip_active(VkPhysicalDevice physical)
     return features.shaderClipDistance == VK_FALSE;
 }
 
+int hybris_cull_active(VkPhysicalDevice physical)
+{
+    struct hybris_layer_physical context;
+    VkPhysicalDeviceFeatures features;
+    if (!hybris_layer_lookup_physical(physical, &context)) return 0;
+    PFN_vkGetPhysicalDeviceFeatures query = (PFN_vkGetPhysicalDeviceFeatures)
+        context.resolver(context.instance, "vkGetPhysicalDeviceFeatures");
+    if (!query) return 0;
+    query(physical, &features);
+    return !features.shaderCullDistance && features.geometryShader;
+}
+
 int hybris_clip_pipeline(const VkGraphicsPipelineCreateInfo *info)
 {
     unsigned vertex = 0, fragment = 0;

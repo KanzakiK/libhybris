@@ -34,6 +34,18 @@ VkFormat hybris_bc_image_format(VkFormat format, unsigned rgb_mask)
     }
 }
 
+int hybris_bc_mutable_format(VkFormat format)
+{
+    return (format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_BC3_SRGB_BLOCK) ||
+        format == VK_FORMAT_BC7_UNORM_BLOCK || format == VK_FORMAT_BC7_SRGB_BLOCK;
+}
+int hybris_bc_view_format_allowed(VkFormat base, VkFormat view, VkImageCreateFlags flags)
+{
+    if (base == view) return 1;
+    return (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && hybris_bc_mutable_format(base) && hybris_bc_mutable_format(view) &&
+        (base - VK_FORMAT_BC1_RGB_UNORM_BLOCK) / 2 == (view - VK_FORMAT_BC1_RGB_UNORM_BLOCK) / 2;
+}
+
 VkExtent3D hybris_bc_image_extent(const struct hybris_bc_image *image, uint32_t mip)
 {
     VkExtent3D extent = {0};
@@ -42,14 +54,20 @@ VkExtent3D hybris_bc_image_extent(const struct hybris_bc_image *image, uint32_t 
     extent.height = image->extent.height >> mip;
     if (!extent.width) extent.width = 1;
     if (!extent.height) extent.height = 1;
-    extent.depth = 1;
+    extent.depth = image->extent.depth >> mip;
+    if (!extent.depth) extent.depth = 1;
     return extent;
+}
+
+VkDeviceSize hybris_bc_image_slice_size(const struct hybris_bc_image *image, uint32_t mip)
+{
+    VkExtent3D extent = hybris_bc_image_extent(image, mip);
+    return ((extent.width + UINT64_C(3)) / 4) * ((extent.height + UINT64_C(3)) / 4) * image->block_bytes;
 }
 
 VkDeviceSize hybris_bc_image_layer_size(const struct hybris_bc_image *image, uint32_t mip)
 {
-    VkExtent3D extent = hybris_bc_image_extent(image, mip);
-    return ((extent.width + UINT64_C(3)) / 4) * ((extent.height + UINT64_C(3)) / 4) * image->block_bytes;
+    return hybris_bc_image_slice_size(image, mip) * hybris_bc_image_extent(image, mip).depth;
 }
 
 void hybris_bc_image_destroy(struct hybris_bc_image *image, const VkAllocationCallbacks *allocator)
@@ -68,13 +86,18 @@ VkResult hybris_bc_image_describe(const VkImageCreateInfo *info, struct hybris_b
     memset(image, 0, sizeof(*image));
     VkFormat format = hybris_bc_image_format(info->format, 0);
     if (format == VK_FORMAT_UNDEFINED ||
-        info->imageType != VK_IMAGE_TYPE_2D || info->tiling != VK_IMAGE_TILING_OPTIMAL ||
+        (info->imageType != VK_IMAGE_TYPE_2D && info->imageType != VK_IMAGE_TYPE_3D) ||
+        info->tiling != VK_IMAGE_TILING_OPTIMAL ||
         info->samples != VK_SAMPLE_COUNT_1_BIT ||
         (info->initialLayout != VK_IMAGE_LAYOUT_UNDEFINED && info->initialLayout != VK_IMAGE_LAYOUT_PREINITIALIZED) ||
-        (info->flags & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT) ||
+        (info->flags & ~(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) ||
+        ((info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && !hybris_bc_mutable_format(info->format)) ||
         !info->usage ||
         (info->usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) ||
-        !info->extent.width || !info->extent.height || info->extent.depth != 1 ||
+        !info->extent.width || !info->extent.height || !info->extent.depth ||
+        (info->imageType == VK_IMAGE_TYPE_2D && info->extent.depth != 1) ||
+        (info->imageType == VK_IMAGE_TYPE_3D &&
+            (info->arrayLayers != 1 || (info->flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT))) ||
         !info->mipLevels || info->mipLevels > 32 || !info->arrayLayers)
         return VK_ERROR_FORMAT_NOT_SUPPORTED;
     /* These chains only constrain views or request no external/swapchain
@@ -83,7 +106,7 @@ VkResult hybris_bc_image_describe(const VkImageCreateInfo *info, struct hybris_b
         if (next->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
             const VkImageFormatListCreateInfo *list = (const void *)next;
             for (uint32_t i = 0; i < list->viewFormatCount; ++i)
-                if (list->pViewFormats[i] != info->format) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+                if (!hybris_bc_view_format_allowed(info->format, list->pViewFormats[i], info->flags)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
         } else if (next->sType == VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO) {
             if (((const VkExternalMemoryImageCreateInfo *)next)->handleTypes)
                 return VK_ERROR_FORMAT_NOT_SUPPORTED;
@@ -95,10 +118,13 @@ VkResult hybris_bc_image_describe(const VkImageCreateInfo *info, struct hybris_b
         }
     }
     uint32_t dimension = info->extent.width > info->extent.height ? info->extent.width : info->extent.height;
+    if (info->extent.depth > dimension) dimension = info->extent.depth;
     uint32_t levels = 1;
     while (dimension >>= 1) ++levels;
     if (info->mipLevels > levels) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     image->format = info->format;
+    image->type = info->imageType;
+    image->flags = info->flags;
     image->extent = info->extent;
     image->mip_levels = info->mipLevels;
     image->layers = info->arrayLayers;
@@ -108,9 +134,9 @@ VkResult hybris_bc_image_describe(const VkImageCreateInfo *info, struct hybris_b
         image->mip_offset[mip] = image->block_size;
         VkExtent3D extent = hybris_bc_image_extent(image, mip);
         uint64_t blocks = ((extent.width + UINT64_C(3)) / 4) * ((extent.height + UINT64_C(3)) / 4);
-        if (blocks > UINT64_MAX / image->block_bytes / image->layers)
+        if (blocks > UINT64_MAX / image->block_bytes / image->layers / extent.depth)
             return VK_ERROR_OUT_OF_DEVICE_MEMORY;
-        uint64_t bytes = blocks * image->block_bytes * image->layers;
+        uint64_t bytes = blocks * image->block_bytes * image->layers * extent.depth;
         if (bytes > UINT64_MAX - image->block_size) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
         image->block_size += bytes;
     }
@@ -150,7 +176,9 @@ VkResult hybris_bc_image_create(VkDevice device, PFN_vkGetDeviceProcAddr resolve
     }
     VkImageCreateInfo decoded = *info;
     decoded.pNext = NULL;
-    image->decoded_format = hybris_bc_image_format(info->format, rgb_mask);
+    /* The two transfer functions must use the same storage representation. */
+    image->decoded_format = hybris_bc_image_format(info->format,
+        (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ? 0 : rgb_mask);
     decoded.format = image->decoded_format;
     decoded.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     result = CreateImage(device, &decoded, allocator, &image->image);

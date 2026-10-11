@@ -331,6 +331,8 @@ if standard_backend:
     # The direct version probe provisions driver.json before loader cases.
     cases += [('icd', mode, 'probe-glibc')
               for mode in ('version', 'egl-vulkan', 'vulkan-egl', 'vertex-policy', 'vertex-policy-direct', 'native-buffer', 'bc-decode', 'bc-images', 'bc-images-gdpa', 'bc-images-dlsym', 'memory-ranges', 'blender-readback', 'groups', 'groups-dlsym', 'vk', 'vk-dlsym', 'vk-gdpa', 'vk-core11', 'vk-khr11', 'dispatch', 'life', 'vk-init', 'vk-alloc', 'icd-alloc-direct', 'unload', 'tls', 'caps', 'caps2', 'ubo', 'ubo-dynamic', 'ubo-multi', 'ubo-large', 'ubo-staged', 'ubo-template')]
+    cases.extend(('icd', mode, 'probe-glibc') for mode in (
+        'bc-images-blit', 'bc-images-blit-scale', 'bc-images-blit-dlsym', 'bc-images-volume'))
     if a.selected_cases:
         cases.extend(('icd', mode, 'probe-glibc') for mode in ('blender-vk', 'blender-vk-5.2', 'vertex-store-raw', 'vertex-store-raw-enabled', 'vertex-store', 'vertex-store-validation', 'vertex-store-features2-validation'))
     cases += [('icd-linked', mode, 'probe-glibc-linked') for mode in ('vk', 'dispatch', 'point-size-linked')]
@@ -378,6 +380,16 @@ if a.capture_tools:
     stage_shader_reference(a.bundle, a.out, metadata)
 
 if standard_backend and a.selected_cases:
+    primitive_modes = (
+        'scaled-vertex-primitive-cull-validation',
+        'scaled-vertex-primitive-cull-validation-block',
+        'scaled-vertex-primitive-lines-validation',
+        'scaled-vertex-primitive-lines-validation-block',
+        'scaled-vertex-primitive-cull-validation-automatic',
+        'scaled-vertex-primitive-cull-validation-block-automatic',
+    )
+    cases.extend(('icd', mode, 'probe-glibc') for mode in primitive_modes
+                 if 'icd-' + mode in a.selected_cases)
     cases.extend(('icd', mode, 'probe-glibc') for mode in ('vertex-policy-restricted', 'vertex-policy-restricted-direct')
                  if 'icd-' + mode in a.selected_cases)
 

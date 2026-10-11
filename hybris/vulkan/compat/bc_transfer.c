@@ -125,7 +125,10 @@ static VkResult decode(struct hybris_bc_transfer *t, VkCommandBuffer command,
         image->decoded_format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
     uint32_t max_width = (uint32_t)(t->scratch_size / (16 * texel_bytes)) * 4;
     if (!max_width) return VK_ERROR_FORMAT_NOT_SUPPORTED;
-    for (uint32_t layer = 0; layer < region->imageSubresource.layerCount; ++layer) {
+    int volume = image->type == VK_IMAGE_TYPE_3D;
+    uint32_t slices = volume ? region->imageExtent.depth : region->imageSubresource.layerCount;
+    uint32_t first_slice = volume ? (uint32_t)region->imageOffset.z : region->imageSubresource.baseArrayLayer;
+    for (uint32_t layer = 0; layer < slices; ++layer) {
         for (uint32_t y = 0; y < region->imageExtent.height; y += 4) {
             uint32_t height = region->imageExtent.height - y;
             if (height > 4) height = 4;
@@ -133,7 +136,7 @@ static VkResult decode(struct hybris_bc_transfer *t, VkCommandBuffer command,
                 uint32_t width = region->imageExtent.width - x;
                 if (width > max_width) width = max_width;
                 VkDeviceSize source = image->mip_offset[mip] +
-                    ((VkDeviceSize)region->imageSubresource.baseArrayLayer + layer) * hybris_bc_image_layer_size(image, mip) +
+                    ((VkDeviceSize)first_slice + layer) * hybris_bc_image_slice_size(image, mip) +
                     ((uint32_t)region->imageOffset.y / 4 + y / 4) * row_bytes +
                     ((uint32_t)region->imageOffset.x / 4 + x / 4) * (VkDeviceSize)image->block_bytes;
                 VkDeviceSize base = source - source % alignment;
@@ -176,7 +179,8 @@ static VkResult decode(struct hybris_bc_transfer *t, VkCommandBuffer command,
                 VkBufferImageCopy copy = {.imageSubresource = region->imageSubresource,
                     .imageOffset = {region->imageOffset.x + (int32_t)x, region->imageOffset.y + (int32_t)y, 0},
                     .imageExtent = {width, height, 1}};
-                copy.imageSubresource.baseArrayLayer += layer;
+                if (volume) copy.imageOffset.z = region->imageOffset.z + (int32_t)layer;
+                else copy.imageSubresource.baseArrayLayer += layer;
                 copy.imageSubresource.layerCount = 1;
                 CmdCopyBufferToImage(command, t->scratch, image->image, layout, 1, &copy);
                 x += width;
@@ -220,9 +224,12 @@ VkResult hybris_bc_copy_buffer_image(struct hybris_bc_transfer *t,
             region->imageExtent.height) + UINT64_C(3)) / 4;
         VkDeviceSize rows = (region->imageExtent.height + UINT64_C(3)) / 4;
         VkDeviceSize width = ((region->imageExtent.width + UINT64_C(3)) / 4) * image->block_bytes;
-        for (uint32_t layer = 0; layer < region->imageSubresource.layerCount; ++layer) {
+        int volume = image->type == VK_IMAGE_TYPE_3D;
+        uint32_t slices = volume ? region->imageExtent.depth : region->imageSubresource.layerCount;
+        uint32_t first_slice = volume ? (uint32_t)region->imageOffset.z : region->imageSubresource.baseArrayLayer;
+        for (uint32_t layer = 0; layer < slices; ++layer) {
             VkDeviceSize image_offset = image->mip_offset[mip] +
-                ((VkDeviceSize)region->imageSubresource.baseArrayLayer + layer) * hybris_bc_image_layer_size(image, mip) +
+                ((VkDeviceSize)first_slice + layer) * hybris_bc_image_slice_size(image, mip) +
                 ((uint32_t)region->imageOffset.y / 4) * row +
                 ((uint32_t)region->imageOffset.x / 4) * (VkDeviceSize)image->block_bytes;
             VkDeviceSize buffer_offset = region->bufferOffset + layer * buffer_row * buffer_height;

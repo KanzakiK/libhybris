@@ -4,6 +4,7 @@
 #include <vulkan/vulkan.h>
 int hybris_bc_enabled(void);
 unsigned hybris_bc_physical_mask(VkPhysicalDevice physical);
+int hybris_bc_complete(VkPhysicalDevice physical);
 int hybris_bc_format_properties(VkPhysicalDevice physical, VkFormat format, VkFormatProperties *properties);
 int hybris_bc_extension_allowed(const char *name);
 VkResult hybris_bc_prepare_device(VkPhysicalDevice physical, const VkDeviceCreateInfo *info);

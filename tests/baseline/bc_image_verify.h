@@ -13,7 +13,7 @@ struct bc_image_readback {
     const uint8_t *source;
     struct hybris_bc_region region;
     uint32_t bytes, dynamic_offset, raw_offset, reference_offset;
-    unsigned format, round, swizzle, patched, filtering, sampler_choice;
+    unsigned format, round, swizzle, patched, filtering, sampler_choice, depth_filter;
 };
 
 static unsigned bc_linear8(unsigned encoded)
@@ -115,6 +115,7 @@ static unsigned bc_verify_image_readback(const struct bc_image_readback *check)
             unsigned sample_word = word - dynamic_offset / 4 - 3 * sample_words * pixels;
             unsigned pixel = sample_word / sample_words;
             unsigned x = pixel % width, y = pixel / width % height, z = pixel / (width * height);
+            unsigned depth_steps = check->depth_filter && z > 0 ? 2 : 1;
             if (f < 2) {
                 /* Native RGBA filtering supplies the RGB oracle. Force
                  * its view alpha to one to model the missing BC1 RGB
@@ -124,10 +125,11 @@ static unsigned bc_verify_image_readback(const struct bc_image_readback *check)
             } else if (f >= 14) {
                 int64_t sums[4] = {0}, maximum[4] = {0};
                 uint64_t texels[4];
+                for (unsigned dz = 0; dz < depth_steps; ++dz)
                 for (unsigned dy = 0; dy < 2; ++dy) for (unsigned dx = 0; dx < 2; ++dx) {
                     unsigned sx = x + dx < width ? x + dx : width - 1;
                     unsigned sy = y + dy < height ? y + dy : height - 1;
-                    unsigned at = 2 * ((z * height + sy) * width + sx);
+                    unsigned at = 2 * (((z - dz) * height + sy) * width + sx);
                     uint64_t rgba = reference_pixels[at] | ((uint64_t)reference_pixels[at + 1] << 32);
                     if (sampler_choice >= 2 && (x + dx >= width || y + dy >= height))
                         rgba = sampler_choice == 2 ? UINT64_C(0x3c003c003c003c00) : UINT64_C(0x3c00000000000000);
@@ -135,11 +137,12 @@ static unsigned bc_verify_image_readback(const struct bc_image_readback *check)
                     for (unsigned c = 0; c < 4; ++c) {
                         unsigned channel = shape_index && c != 1 && c != 3 ? 2 - c : c;
                         int64_t value = bc_half_units((uint16_t)(rgba >> (16 * channel)));
-                        sums[c] += value;
+                        sums[c] += value * (depth_steps == 2 ? (dz == 0 ? 3 : 1) : 1);
                         int64_t magnitude = value < 0 ? -value : value;
                         if (magnitude > maximum[c]) maximum[c] = magnitude;
                     }
                 }
+                if (depth_steps == 2) for (unsigned c = 0; c < 4; ++c) sums[c] /= 4;
                 matches = 1; expected = 0;
                 for (unsigned c = 0; c < 2; ++c) {
                     unsigned channel = 2 * (sample_word & 1) + c;
@@ -162,19 +165,22 @@ static unsigned bc_verify_image_readback(const struct bc_image_readback *check)
                  * The separate BC/native comparison remains bit exact. */
                 int sums[4] = {0};
                 uint32_t texels[4];
+                for (unsigned dz = 0; dz < depth_steps; ++dz)
                 for (unsigned dy = 0; dy < 2; ++dy) for (unsigned dx = 0; dx < 2; ++dx) {
                     unsigned sx = x + dx < width ? x + dx : width - 1;
                     unsigned sy = y + dy < height ? y + dy : height - 1;
-                    uint32_t packed = bc_reference_load(reference_pixels, f, (z * height + sy) * width + sx);
+                    uint32_t packed = bc_reference_load(reference_pixels, f, ((z - dz) * height + sy) * width + sx);
                     if (sampler_choice >= 2 && (x + dx >= width || y + dy >= height))
                         packed = sampler_choice == 2 ? 0xffffffff : sampler_choice == 4 ? 0xff000000 : 0;
                     if (shape_index) packed = (packed & 0xff00ff00) | ((packed & 255) << 16) | ((packed >> 16) & 255);
                     texels[2 * dy + dx] = packed;
                     for (unsigned c = 0; c < 4; ++c) {
                         unsigned value = (packed >> (8 * c)) & 255;
-                        sums[c] += (f & 1) && c < 3 ? bc_linear8(value) : value;
+                        sums[c] += ((f & 1) && c < 3 ? bc_linear8(value) : value) *
+                            (depth_steps == 2 ? (dz == 0 ? 3 : 1) : 1);
                     }
                 }
+                if (depth_steps == 2) for (unsigned c = 0; c < 4; ++c) sums[c] /= 4;
                 matches = 1; expected = 0;
                 for (unsigned c = 0; c < 4; ++c) {
                     int got = (actual[word] >> (8 * c)) & 255;
@@ -191,20 +197,23 @@ static unsigned bc_verify_image_readback(const struct bc_image_readback *check)
                  * exact half weights. Check native RG16 filtering against
                  * that average; the BC-to-native comparison above is exact. */
                 int sums[4] = {0};
+                for (unsigned dz = 0; dz < depth_steps; ++dz)
                 for (unsigned dy = 0; dy < 2; ++dy) for (unsigned dx = 0; dx < 2; ++dx) {
                     unsigned sx = x + dx < width ? x + dx : width - 1;
                     unsigned sy = y + dy < height ? y + dy : height - 1;
-                    uint32_t packed = bc_reference_load(reference_pixels, f, (z * height + sy) * width + sx);
+                    uint32_t packed = bc_reference_load(reference_pixels, f, ((z - dz) * height + sy) * width + sx);
                     if (sampler_choice >= 2 && (x + dx >= width || y + dy >= height)) {
                         uint32_t maximum = f & 1 ? 32767 : 65535;
                         packed = sampler_choice == 2 ? maximum | (mode >= 6 ? maximum << 16 : 0) : 0;
                     }
                     int red = f & 1 ? (int16_t)packed : (int)(packed & 65535);
                     int green = f & 1 ? (int16_t)(packed >> 16) : (int)(packed >> 16);
-                    sums[shape_index ? 2 : 0] += red;
-                    sums[1] += green;
-                    sums[3] += f & 1 ? 32767 : 65535;
+                    int weight = depth_steps == 2 ? (dz == 0 ? 3 : 1) : 1;
+                    sums[shape_index ? 2 : 0] += red * weight;
+                    sums[1] += green * weight;
+                    sums[3] += (f & 1 ? 32767 : 65535) * weight;
                 }
+                if (depth_steps == 2) for (unsigned c = 0; c < 4; ++c) sums[c] /= 4;
                 matches = 1; expected = 0;
                 for (unsigned c = 0; c < 2; ++c) {
                     unsigned component = 2 * (sample_word & 1) + c;

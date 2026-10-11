@@ -89,6 +89,40 @@ static int emulates(VkPhysicalDevice physical, VkFormat format)
     return format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_BC7_SRGB_BLOCK &&
         (hybris_bc_physical_mask(physical) & (1u << (format - VK_FORMAT_BC1_RGB_UNORM_BLOCK)));
 }
+/* Core BC requires every format's sampled, linear-filtered and source-blit
+ * domain for both 2D and 3D images. Optional creation flags are queried
+ * independently; do not infer complete support from the decoder mask alone. */
+int hybris_bc_complete(VkPhysicalDevice physical)
+{
+    unsigned mask = hybris_bc_physical_mask(physical);
+    if (!mask) return 0;
+    struct hybris_layer_physical context;
+    if (!hybris_layer_lookup_physical(physical, &context)) return 0;
+    PHYSICAL_PROC(GetPhysicalDeviceFormatProperties);
+    PHYSICAL_PROC(GetPhysicalDeviceImageFormatProperties);
+    unsigned rgb = physical_rgb_mask(physical);
+    /* RGB formats must preserve absent-alpha and border semantics. */
+    if ((mask & 3) && (rgb & 3) != 3) return 0;
+    if ((mask & (3u << 12)) && !(rgb & 4)) return 0;
+    VkFormatFeatureFlags required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+        VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT | VK_FORMAT_FEATURE_BLIT_SRC_BIT |
+        VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    for (unsigned i = 0; i < 16; ++i) {
+        VkFormat format = VK_FORMAT_BC1_RGB_UNORM_BLOCK + i;
+        if (mask & (1u << i)) format = hybris_bc_image_format(format, rgb);
+        VkFormatProperties properties;
+        GetPhysicalDeviceFormatProperties(physical, format, &properties);
+        if ((properties.optimalTilingFeatures & required) != required) return 0;
+        for (VkImageType type = VK_IMAGE_TYPE_2D; type <= VK_IMAGE_TYPE_3D; ++type) {
+            VkImageFormatProperties images;
+            if (GetPhysicalDeviceImageFormatProperties(physical, format, type,
+                VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT |
+                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                0, &images) != VK_SUCCESS || !(images.sampleCounts & VK_SAMPLE_COUNT_1_BIT)) return 0;
+        }
+    }
+    return 1;
+}
 int hybris_bc_format_properties(VkPhysicalDevice physical, VkFormat format, VkFormatProperties *properties)
 {
     if (!emulates(physical, format)) return 0;
@@ -99,14 +133,19 @@ int hybris_bc_format_properties(VkPhysicalDevice physical, VkFormat format, VkFo
     GetPhysicalDeviceFormatProperties(physical, hybris_bc_image_format(format, physical_rgb_mask(physical)), &decoded);
     *properties = (VkFormatProperties){.optimalTilingFeatures = decoded.optimalTilingFeatures &
         (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
-         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT)};
+         VK_FORMAT_FEATURE_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+         VK_FORMAT_FEATURE_BLIT_SRC_BIT)};
+    /* The public image handle is the decoded native image. Source blits can
+     * use the driver's existing conversion/filtering path without a new
+     * command wrapper. Destination blits remain unsupported: they would need
+     * to update the compressed backing as well as the decoded image. */
     return 1;
 }
 int hybris_bc_extension_allowed(const char *name)
 {
     static const char *const unsupported[] = {
         "VK_EXT_descriptor_buffer", "VK_KHR_push_descriptor", "VK_EXT_shader_object",
-        "VK_KHR_maintenance6", "VK_KHR_maintenance8", "VK_EXT_host_image_copy",
+        "VK_NV_per_stage_descriptor_set", "VK_KHR_maintenance8", "VK_EXT_host_image_copy",
         "VK_QCOM_rotated_copy_commands", "VK_EXT_device_generated_commands",
         "VK_NV_device_generated_commands", "VK_NV_device_generated_commands_compute",
         "VK_NV_dedicated_allocation", "VK_NV_copy_memory_indirect"
@@ -122,12 +161,14 @@ static unsigned unsupported_feature_count(VkStructureType type)
     switch (type) {
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT: return 4;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT:
-    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR:
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT:
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COPY_MEMORY_INDIRECT_FEATURES_NV:
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_NV: return 1;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_COMPUTE_FEATURES_NV: return 3;
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEVICE_GENERATED_COMMANDS_FEATURES_EXT: return 2;
+    /* Per-stage descriptor binding and inline pipeline layouts cannot be
+     * restored by the compute-state journal. maintenance6 alone needs neither. */
+    case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PER_STAGE_DESCRIPTOR_SET_FEATURES_NV: return 2;
 #ifdef VK_KHR_maintenance8
     case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_8_FEATURES_KHR: return 1;
 #endif
@@ -139,7 +180,9 @@ VkResult hybris_bc_prepare_device(VkPhysicalDevice physical, const VkDeviceCreat
     if (!hybris_bc_physical_mask(physical)) return VK_SUCCESS;
     for (uint32_t i = 0; i < info->enabledExtensionCount; ++i)
         if (!hybris_bc_extension_allowed(info->ppEnabledExtensionNames[i])) return VK_ERROR_EXTENSION_NOT_PRESENT;
-    if (info->pEnabledFeatures && (info->pEnabledFeatures->pipelineStatisticsQuery || info->pEnabledFeatures->textureCompressionBC)) return VK_ERROR_FEATURE_NOT_PRESENT;
+    int complete = hybris_bc_complete(physical);
+    if (info->pEnabledFeatures && (info->pEnabledFeatures->pipelineStatisticsQuery ||
+        (info->pEnabledFeatures->textureCompressionBC && !complete))) return VK_ERROR_FEATURE_NOT_PRESENT;
     for (const VkBaseInStructure *node = info->pNext; node; node = node->pNext) {
         unsigned count = unsupported_feature_count(node->sType);
         for (unsigned i = 0; i < count; ++i) {
@@ -151,7 +194,7 @@ VkResult hybris_bc_prepare_device(VkPhysicalDevice physical, const VkDeviceCreat
             ((const VkDeviceGroupDeviceCreateInfo *)node)->physicalDeviceCount != 1) return VK_ERROR_FEATURE_NOT_PRESENT;
         if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 &&
             (((const VkPhysicalDeviceFeatures2 *)node)->features.pipelineStatisticsQuery ||
-             ((const VkPhysicalDeviceFeatures2 *)node)->features.textureCompressionBC)) return VK_ERROR_FEATURE_NOT_PRESENT;
+             (((const VkPhysicalDeviceFeatures2 *)node)->features.textureCompressionBC && !complete))) return VK_ERROR_FEATURE_NOT_PRESENT;
         if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES &&
             ((const VkPhysicalDeviceVulkan11Features *)node)->protectedMemory) return VK_ERROR_FEATURE_NOT_PRESENT;
         if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES &&
@@ -203,7 +246,10 @@ static void VKAPI_CALL features(VkPhysicalDevice physical, VkPhysicalDeviceFeatu
     if (!hybris_layer_lookup_physical(physical, &context)) return;
     PHYSICAL_PROC(GetPhysicalDeviceFeatures);
     GetPhysicalDeviceFeatures(physical, out);
-    if (hybris_bc_physical_mask(physical)) out->pipelineStatisticsQuery = out->textureCompressionBC = VK_FALSE;
+    if (hybris_bc_physical_mask(physical)) {
+        out->pipelineStatisticsQuery = VK_FALSE;
+        out->textureCompressionBC = hybris_bc_complete(physical);
+    }
 }
 static void features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *out, const char *name)
 {
@@ -212,7 +258,8 @@ static void features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *out,
     PFN_vkGetPhysicalDeviceFeatures2 query = (PFN_vkGetPhysicalDeviceFeatures2)context.resolver(context.instance, name);
     query(physical, out);
     if (!hybris_bc_physical_mask(physical)) return;
-    out->features.pipelineStatisticsQuery = out->features.textureCompressionBC = VK_FALSE;
+    out->features.pipelineStatisticsQuery = VK_FALSE;
+    out->features.textureCompressionBC = hybris_bc_complete(physical);
     for (VkBaseOutStructure *node = out->pNext; node; node = node->pNext) {
         unsigned count = unsupported_feature_count(node->sType);
         if (count) memset((char *)node + sizeof(VkBaseOutStructure), 0, count * sizeof(VkBool32));
@@ -252,11 +299,14 @@ static void VKAPI_CALL sparse_properties2_core(VkPhysicalDevice physical, const 
 static void VKAPI_CALL sparse_properties2_khr(VkPhysicalDevice physical, const VkPhysicalDeviceSparseImageFormatInfo2 *info,
     uint32_t *count, VkSparseImageFormatProperties2 *out)
 { sparse_properties2(physical, info, count, out, "vkGetPhysicalDeviceSparseImageFormatProperties2KHR"); }
-static int image_supported(VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags)
+static int image_supported(VkFormat format, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags)
 {
-    return type == VK_IMAGE_TYPE_2D && tiling == VK_IMAGE_TILING_OPTIMAL && usage &&
+    return (type == VK_IMAGE_TYPE_2D || type == VK_IMAGE_TYPE_3D) &&
+        (type != VK_IMAGE_TYPE_3D || !(flags & VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT)) &&
+        tiling == VK_IMAGE_TILING_OPTIMAL && usage &&
         !(usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) &&
-        !(flags & ~VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT);
+        !(flags & ~(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) &&
+        (!(flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) || hybris_bc_mutable_format(format));
 }
 static VkResult VKAPI_CALL image_properties(VkPhysicalDevice physical, VkFormat format, VkImageType type,
     VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, VkImageFormatProperties *out)
@@ -265,8 +315,9 @@ static VkResult VKAPI_CALL image_properties(VkPhysicalDevice physical, VkFormat 
     if (!hybris_layer_lookup_physical(physical, &context)) return VK_ERROR_INITIALIZATION_FAILED;
     PHYSICAL_PROC(GetPhysicalDeviceImageFormatProperties);
     if (emulates(physical, format)) {
-        if (!image_supported(type, tiling, usage, flags)) { *out = (VkImageFormatProperties){0}; return VK_ERROR_FORMAT_NOT_SUPPORTED; }
-        VkResult result = GetPhysicalDeviceImageFormatProperties(physical, hybris_bc_image_format(format, physical_rgb_mask(physical)), type,
+        if (!image_supported(format, type, tiling, usage, flags)) { *out = (VkImageFormatProperties){0}; return VK_ERROR_FORMAT_NOT_SUPPORTED; }
+        VkResult result = GetPhysicalDeviceImageFormatProperties(physical, hybris_bc_image_format(format,
+            (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ? 0 : physical_rgb_mask(physical)), type,
             tiling, usage | VK_IMAGE_USAGE_TRANSFER_DST_BIT, flags, out);
         if (result == VK_SUCCESS) out->sampleCounts &= VK_SAMPLE_COUNT_1_BIT;
         return result;
@@ -282,21 +333,22 @@ static VkResult image_properties2(VkPhysicalDevice physical, const VkPhysicalDev
         (PFN_vkGetPhysicalDeviceImageFormatProperties2)context.resolver(context.instance, name);
     if (!emulates(physical, info->format)) return query(physical, info, out);
     out->imageFormatProperties = (VkImageFormatProperties){0};
-    if (!image_supported(info->type, info->tiling, info->usage, info->flags)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    if (!image_supported(info->format, info->type, info->tiling, info->usage, info->flags)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     for (const VkBaseInStructure *node = info->pNext; node; node = node->pNext) {
         if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO) {
             if (((const VkPhysicalDeviceExternalImageFormatInfo *)node)->handleType) return VK_ERROR_FORMAT_NOT_SUPPORTED;
         } else if (node->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
             const VkImageFormatListCreateInfo *list = (const void *)node;
             for (uint32_t i = 0; i < list->viewFormatCount; ++i)
-                if (list->pViewFormats[i] != info->format) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+                if (!hybris_bc_view_format_allowed(info->format, list->pViewFormats[i], info->flags)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
         } else if (node->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_VIEW_IMAGE_FORMAT_INFO_EXT) {
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         }
     }
     VkPhysicalDeviceImageFormatInfo2 translated = *info;
     translated.pNext = NULL;
-    translated.format = hybris_bc_image_format(info->format, physical_rgb_mask(physical));
+    translated.format = hybris_bc_image_format(info->format,
+        (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ? 0 : physical_rgb_mask(physical));
     translated.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     VkResult result = query(physical, &translated, out);
     if (result != VK_SUCCESS) return result;

@@ -34,6 +34,17 @@ static int has_clip_capability(const uint32_t *code, size_t bytes)
     return 0;
 }
 
+static int has_direct_cull(const uint32_t *code, size_t bytes)
+{
+    for (size_t at = 5; at < bytes / 4;) {
+        uint32_t count = code[at] >> 16, op = code[at] & 65535;
+        if (!count || count > bytes / 4 - at) return 0;
+        if (op == 71 && count == 4 && code[at + 2] == 11 && code[at + 3] == 4) return 1;
+        at += count;
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     uint32_t location = 0, count = 0;
@@ -81,5 +92,60 @@ int main(int argc, char **argv)
         count, location, vs_size, fs_size);
     free(vs);
     free(fs);
+    vs = NULL;
+    result = hybris_spirv_clip_vertex(kClipCullVertex, sizeof(kClipCullVertex), location, NULL,
+        &vs, &vs_size, &vs_made);
+    if (result != VK_SUCCESS || !vs || !vs_made || !has_direct_cull(vs, vs_size)) {
+        fprintf(stderr, "clip rewrite removed active CullDistance result=%d made=%u\n", result, vs_made);
+        free(vs);
+        return 1;
+    }
+    snprintf(path, sizeof(path), "%s/clip-cull-vs.spv", dir);
+    if (!write_spv(path, vs, vs_size) || !validate(path)) {
+        fprintf(stderr, "mixed clip/cull vertex failed spirv-val\n");
+        free(vs);
+        return 1;
+    }
+    free(vs);
+    puts("CLIP_REWRITE active CullDistance preserved spirv-val=ok");
+    const uint32_t *cull_inputs[] = {kClipCullVertex, kClipBlockCullVertex};
+    const size_t cull_sizes[] = {sizeof(kClipCullVertex), sizeof(kClipBlockCullVertex)};
+    for (unsigned fixture = 0; fixture < 2; ++fixture) {
+        vs = NULL;
+        result = hybris_spirv_cull_vertex(cull_inputs[fixture], cull_sizes[fixture], location, NULL,
+            &vs, &vs_size, &vs_made);
+        if (result != VK_SUCCESS || !vs || !vs_made || !has_clip_capability(vs, vs_size)) {
+            fprintf(stderr, "cull extraction failed or lost ClipDistance fixture=%u result=%d\n", fixture, result);
+            free(vs);
+            return 1;
+        }
+        snprintf(path, sizeof(path), "%s/cull-extract-%u.spv", dir, fixture);
+        if (!write_spv(path, vs, vs_size) || !validate(path)) {
+            fprintf(stderr, "cull extraction failed spirv-val fixture=%u\n", fixture);
+            free(vs);
+            return 1;
+        }
+        free(vs);
+    }
+    puts("CULL_EXTRACT separate and block outputs preserve ClipDistance spirv-val=ok");
+    const uint32_t *span_inputs[] = {kClipSpanVertex, kClipWideVertex, kClipMemberVertex};
+    const size_t span_sizes[] = {sizeof(kClipSpanVertex), sizeof(kClipWideVertex), sizeof(kClipMemberVertex)};
+    const uint32_t expected_locations[] = {22, 19, 20};
+    for (unsigned fixture = 0; fixture < 3; ++fixture) {
+        result = hybris_spirv_clip_plan(span_inputs[fixture], span_sizes[fixture],
+            kClipFragment, sizeof(kClipFragment), &location, &count);
+        if (result != VK_SUCCESS || count != 6 || location != expected_locations[fixture]) {
+            fprintf(stderr, "location span failed fixture=%u result=%d location=%u count=%u\n", fixture, result, location, count);
+            return 1;
+        }
+        vs = NULL;
+        result = hybris_spirv_clip_vertex(span_inputs[fixture], span_sizes[fixture], location, NULL,
+            &vs, &vs_size, &vs_made);
+        if (result != VK_SUCCESS || !vs || !vs_made) return 1;
+        snprintf(path, sizeof(path), "%s/clip-span-%u.spv", dir, fixture);
+        if (!write_spv(path, vs, vs_size) || !validate(path)) { free(vs); return 1; }
+        free(vs);
+    }
+    puts("DISTANCE_PLAN matrix/array/wide/member location spans preserved spirv-val=ok");
     return 0;
 }

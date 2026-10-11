@@ -92,8 +92,8 @@ static VkDeviceSize block_offset(const struct hybris_bc_image *image,
     VkExtent3D extent = hybris_bc_image_extent(image, subresource->mipLevel);
     VkDeviceSize stride = ((extent.width + UINT64_C(3)) / 4) * image->block_bytes;
     return image->mip_offset[subresource->mipLevel] +
-        ((VkDeviceSize)subresource->baseArrayLayer + layer) *
-            hybris_bc_image_layer_size(image, subresource->mipLevel) +
+        ((VkDeviceSize)(image->type == VK_IMAGE_TYPE_3D ? (uint32_t)offset.z : subresource->baseArrayLayer) + layer) *
+            hybris_bc_image_slice_size(image, subresource->mipLevel) +
         ((uint32_t)offset.y / 4 + row) * stride +
         (uint32_t)offset.x / 4 * (VkDeviceSize)image->block_bytes;
 }
@@ -161,8 +161,8 @@ static void copy_images(struct hybris_bc_device *device, struct hybris_bc_comman
         if (destination->emulated.image) {
             VkBufferImageCopy decode = {.imageSubresource = region->dstSubresource,
                 .imageOffset = region->dstOffset, .imageExtent = destination_extent};
-            decode.imageSubresource.layerCount = layers;
-            decode.imageExtent.depth = 1;
+            decode.imageSubresource.layerCount = destination->type == VK_IMAGE_TYPE_3D ? 1 : layers;
+            decode.imageExtent.depth = destination->type == VK_IMAGE_TYPE_3D ? layers : 1;
             if (hybris_bc_decode_image(&command->transfer, command->handle, &command->state,
                 &destination->emulated, destination_layout, &decode) != VK_SUCCESS) return;
         }

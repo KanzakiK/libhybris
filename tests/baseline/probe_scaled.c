@@ -3,10 +3,20 @@
 #include "allocation_fixture.h"
 #include "scaled_fixture.h"
 #include "scaled_divisor.h"
+#include "shaders/primitive.inc"
+#include "clip_distance.h"
+#include "primitive_adapter.h"
 enum { kScaledImage = 16 };
 int scaled_vertex_probe(int validate, int route, const char *mode) {
+  const int primitive = strstr(mode, "primitive-") != NULL;
+  const int automatic = primitive && strstr(mode, "-automatic") != NULL;
+  const int lines = strstr(mode, "primitive-lines") != NULL;
+  static const struct scaled_shader primitive_shader = {"", primitive_cull_vertex_spv, sizeof(primitive_cull_vertex_spv), 0, 0, 0, 0, 0};
+  static const struct scaled_shader primitive_block_shader = {"", primitive_cull_block_vertex_spv, sizeof(primitive_cull_block_vertex_spv), 0, 0, 0, 0, 0};
   const struct scaled_shader *shader = shaders;
   while (!strstr(mode, shader->mode)) ++shader;
+  if (primitive) shader = &primitive_shader;
+  if (primitive && strstr(mode, "-block")) shader = &primitive_block_shader;
   const int multiple = shader->multiple, aggregate = shader->aggregate, specialized = shader->specialized;
   const unsigned instance_mode = shader->instance_mode;
   const int dynamic_stride = strstr(mode, "divisor-stride") != NULL;
@@ -145,6 +155,14 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
   VkDeviceCreateInfo dc = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
                            .queueCreateInfoCount = 1,
                            .pQueueCreateInfos = &qc};
+  VkPhysicalDeviceFeatures primitive_features = {0};
+  if (primitive) {
+    V(vkGetPhysicalDeviceFeatures);
+    p_vkGetPhysicalDeviceFeatures(pd, &primitive_features);
+    if (!primitive_features.geometryShader) { puts("PRIMITIVE_UNSUPPORTED geometryShader"); return 3; }
+    primitive_features = (VkPhysicalDeviceFeatures){.geometryShader = automatic ? VK_FALSE : VK_TRUE};
+    dc.pEnabledFeatures = &primitive_features;
+  }
   VkPhysicalDeviceVertexAttributeDivisorFeaturesKHR divisor_features = {0};
   const char *divisor_extension = NULL;
   const char *stride_extensions[2];
@@ -266,11 +284,38 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
     .codeSize = shader->size, .pCode = shader->code};
   VkShaderModuleCreateInfo fs_ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
     .codeSize = sizeof(kScaledFragSpv), .pCode = kScaledFragSpv};
-  VkShaderModule vs, fs;
+  VkShaderModule vs, fs, gs = VK_NULL_HANDLE;
+  uint32_t *primitive_code = NULL;
+  uint32_t primitive_location = 0, primitive_distances = 0;
+  if (primitive && !automatic) {
+    size_t size = 0;
+    unsigned rewritten = 0;
+    CHECK(hybris_spirv_cull_plan(shader->code, shader->size, fs_ci.pCode, fs_ci.codeSize,
+      &primitive_location, &primitive_distances));
+    if (!primitive_distances) { puts("PRIMITIVE expected active CullDistance"); return 1; }
+    CHECK(hybris_spirv_cull_vertex(shader->code, shader->size, primitive_location, &callbacks,
+      &primitive_code, &size, &rewritten));
+    if (!primitive_code || !rewritten) { puts("PRIMITIVE CullDistance extraction failed"); return 1; }
+    vs_ci.pCode = primitive_code;
+    vs_ci.codeSize = size;
+  }
   CHECK(p_vkCreateShaderModule(device, &vs_ci, &callbacks, &vs));
   if (multiple) fs = vs;
   else CHECK(p_vkCreateShaderModule(device, &fs_ci, &callbacks, &fs));
+  if (primitive && !automatic) {
+    uint32_t *geometry = NULL;
+    size_t geometry_size = 0;
+    const char *reason = NULL;
+    CHECK(hybris_spirv_primitive_adapter(primitive_code, vs_ci.codeSize, primitive_location, primitive_distances, lines,
+      &callbacks, &geometry, &geometry_size, &reason));
+    VkShaderModuleCreateInfo gs_ci = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
+      .codeSize = geometry_size, .pCode = geometry};
+    CHECK(p_vkCreateShaderModule(device, &gs_ci, &callbacks, &gs));
+    hybris_scaled_free(&callbacks, geometry);
+  }
+  hybris_scaled_free(&callbacks, primitive_code);
   VkPushConstantRange push = {VK_SHADER_STAGE_VERTEX_BIT, 0, instance_mode ? 80 : aggregate ? 64 : 16};
+  if (primitive) push.size = 20;
   VkPipelineLayoutCreateInfo pl_ci = {.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
     .pushConstantRangeCount = 1, .pPushConstantRanges = &push};
   VkPipelineLayout pipeline_layout;
@@ -312,7 +357,7 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
                                    .layers = 1};
   VkFramebuffer fb = VK_NULL_HANDLE;
   CHECK(p_vkCreateFramebuffer(device, &fb_ci, NULL, &fb));
-  VkPipelineShaderStageCreateInfo stages[2] = {
+  VkPipelineShaderStageCreateInfo stages[3] = {
       {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
        .stage = VK_SHADER_STAGE_VERTEX_BIT,
        .module = vs,
@@ -320,7 +365,9 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
       {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
        .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
        .module = fs,
-       .pName = "main"}};
+       .pName = "main"},
+      {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+       .stage = VK_SHADER_STAGE_GEOMETRY_BIT, .module = gs, .pName = "main"}};
   VkPipelineVertexInputStateCreateInfo vi = {
       .sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
   VkPipelineInputAssemblyStateCreateInfo ia = {
@@ -350,7 +397,7 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
       .pAttachments = &cba};
   VkGraphicsPipelineCreateInfo gp = {
       .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-      .stageCount = 2,
+      .stageCount = primitive && !automatic ? 3 : 2,
       .pStages = stages,
       .pVertexInputState = &vi,
       .pInputAssemblyState = &ia,
@@ -418,7 +465,7 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
     attributes[aggregate ? 1 : 0].format = f->format;
     attributes[2].format = second->format;
     binding.stride = dynamic_stride ? 0 : aggregate ? 64 : f->bits / 8 * f->components;
-    unsigned rounds = instance_mode ? (instance_mode & 2 ? 1 : 3) : specialized ? 4 : 1;
+    unsigned rounds = primitive ? 2 : instance_mode ? (instance_mode & 2 ? 1 : 3) : specialized ? 4 : 1;
     for (unsigned round = 0; round < rounds; ++round) {
       const uint32_t column_counts[] = {2, 4, 3, 2};
       float tint = round == 2 ? 1.0f : 0.5f;
@@ -512,7 +559,10 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
           printf("SCALED STRIDE case=%u round=%u phase=%u offset=4 overwritten=%llu stride=%llu\n",
               c, round, phase, (unsigned long long)overwritten_stride, (unsigned long long)fetch_stride);
         } else p_vkCmdBindVertexBuffers(cb, 0, 1, &ibo, &offset);
-        p_vkCmdPushConstants(cb, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, push.size, expected);
+        p_vkCmdPushConstants(cb, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 0, primitive ? 16 : push.size, expected);
+        unsigned primitive_mode = phase + 3 * (round & 1);
+        unsigned primitive_push = primitive_mode | (lines ? 256u : 0u);
+        if (primitive) p_vkCmdPushConstants(cb, pipeline_layout, VK_SHADER_STAGE_VERTEX_BIT, 16, 4, &primitive_push);
         p_vkCmdDraw(cb, instance_mode ? 6 : 3, instance_mode ? 4 : 1, 0, first_instance);
         p_vkCmdEndRenderPass(cb);
         VkBufferImageCopy copy = {
@@ -535,13 +585,26 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
         uint8_t *pixels;
         CHECK(p_vkMapMemory(device, rmem, 0, kScaledImage*kScaledImage*4, 0, (void **)&pixels));
         unsigned bad = 0;
+        unsigned lit = 0;
         for (unsigned pixel = 0; pixel < kScaledImage*kScaledImage; ++pixel)
+        {
+          int clear_pixel = primitive && (primitive_mode == 1 || primitive_mode == 3);
+          if (primitive && lines && !clear_pixel) {
+            clear_pixel = pixels[pixel*4+3] == 0;
+            if (!clear_pixel) ++lit;
+          }
           for (unsigned component = 0; component < 4; ++component) {
             unsigned expected_byte = phase == 2 && component == 0 ? 0 : 255;
+            if (clear_pixel) expected_byte = 0;
             if (alternate_entry || (specialized && invert)) expected_byte = 255 - expected_byte;
             if (specialized && tint == 0.5f && expected_byte) expected_byte = 128;
             if (pixels[pixel*4+component] != expected_byte) ++bad;
           }
+        }
+        if (primitive && lines && primitive_mode != 1 && primitive_mode != 3) {
+          if (lit < 12 || lit > 40 || pixels[(5*kScaledImage+5)*4+3] != 0) ++bad;
+        }
+        if (primitive) printf("PRIMITIVE case=%u mode=%u lines=%u lit=%u bad=%u\n", c, primitive_mode, lines, lit, bad);
         printf("SCALED format=%s entry=%s phase=%u expected=%g,%g,%g,%g pixel=%u,%u,%u,%u bad=%u\n",
           f->name, stages[0].pName, phase, expected[0], expected[1], expected[2], expected[3], pixels[0],pixels[1],pixels[2],pixels[3],bad);
         failures += !!bad;
@@ -572,6 +635,7 @@ int scaled_vertex_probe(int validate, int route, const char *mode) {
   p_vkDestroyPipelineLayout(device, pipeline_layout, NULL);
   p_vkDestroyShaderModule(device, vs, &callbacks);
   if (!multiple) p_vkDestroyShaderModule(device, fs, &callbacks);
+  if (gs) p_vkDestroyShaderModule(device, gs, &callbacks);
   p_vkDestroyImageView(device, view, NULL);
   p_vkDestroyImage(device, image, NULL);
   p_vkDestroyBuffer(device, readback, NULL);

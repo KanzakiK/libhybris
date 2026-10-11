@@ -5,8 +5,9 @@ cd "$(dirname "$0")"
 ROOT="$(cd ../.. && pwd)"
 OUT="${OUT:-$PWD/build}"
 BUNDLE="$OUT/bundle"
-SOURCES=(probe_vertex_store.c probe_vertex_policy.c probe_point_size.c probe_bc_images.c probe_bc.c compat/bc_decode.c probe_native_buffer.c probe_scaled.c probe_memory_ranges.c probe_timeline.c probe_timeline_queues.c render_path.c probe_render_owners.c probe_render_segments.c probe.c probe_stdio.c probe_common.c probe_egl.c probe_egl_lifecycle.c probe_vulkan.c probe_dispatch.c
+SOURCES=(compat/spirv_clip.c compat/spirv_builtins.c compat/spirv_entry.c compat/spirv_decorations.c probe_vertex_store.c probe_vertex_policy.c probe_point_size.c probe_bc_images.c probe_bc.c compat/bc_decode.c probe_native_buffer.c probe_scaled.c probe_memory_ranges.c probe_timeline.c probe_timeline_queues.c render_path.c probe_render_owners.c probe_render_segments.c probe.c probe_stdio.c probe_common.c probe_egl.c probe_egl_lifecycle.c probe_vulkan.c probe_dispatch.c
          probe_icd_version.c probe_tls_mrs.c probe_namespaces.c probe_groups.c probe_lifecycle.c probe_vulkan_init.c probe_alloc.c probe_lock_init.c probe_cond_init.c probe_cond_clock.c probe_shared_unavailable.c probe_tls_bounds.c probe_tls_destructor.c probe_caps.c probe_caps2.c probe_blender_vk.c probe_properties2.c probe_widget.c probe_validation.c)
+SOURCES+=(compat/primitive_adapter.c)
 HYBRIS_LIB="${HYBRIS_LIB:-$OUT/install/usr/lib/hybris}"
 RUNTIME="${RUNTIME:-$OUT/runtime}"
 if [[ -z "${BIONIC_CC:-}" ]]; then
@@ -30,6 +31,8 @@ rm -rf "$PROBE_SRC"
 mkdir -p "$PROBE_SRC/shaders" "$PROBE_SRC/compat/shaders" "$PROBE_SRC/reference"
 cp -r reference/bc7 reference/bc6h "$PROBE_SRC/reference/"
 cp "$ROOT/hybris/vulkan/compat/"bc_decode.{c,h} "$PROBE_SRC/compat/"
+cp "$ROOT/hybris/vulkan/compat/"primitive_adapter.{c,h} "$PROBE_SRC/compat/"
+cp "$ROOT/hybris/vulkan/compat/"{spirv_clip.c,spirv_builtins.c,spirv_entry.c,spirv_decorations.c,clip_distance.h,spirv_builtins.h,spirv_entry.h,spirv_decorations.h,scaled_vertex.h,spirv_literals.inc,spirv_results.inc} "$PROBE_SRC/compat/"
 cp "$ROOT/hybris/vulkan/compat/shaders/"bc7.glsl "$ROOT/hybris/vulkan/compat/shaders/"bc6h.glsl "$ROOT/hybris/vulkan/compat/shaders/"LICENSE.bcdec "$ROOT/hybris/vulkan/compat/shaders/"bc_decode.{comp,inc} "$ROOT/hybris/vulkan/compat/shaders/generate-bc.py" "$PROBE_SRC/compat/shaders/"
 cp bc_half_verify.h bc6h_fixture.inc bc7_fixture.inc widget_pipeline.h bc_image_verify.h bc_fixture.h native_buffer_render.h native_buffer_fixture.h scaled_divisor.h scaled_fixture.h allocation_fixture.h render_path.h tls_fixture.cpp sync_fixture.h stdio_fixture.h widget_fixture.h "$PROBE_SRC/"
 for source in "${SOURCES[@]}"; do
@@ -37,7 +40,9 @@ for source in "${SOURCES[@]}"; do
 done
 cp probe.h dispatch_commands.inc capability_fields.inc feature_compare.inc property_compare.inc "$PROBE_SRC/"
 cp shaders/vertex-store.vert shaders/vertex-store.inc "$PROBE_SRC/shaders/"
-cp shaders/packed.vert shaders/packed.inc shaders/generate-packed.py shaders/point-size.vert shaders/point-size.frag shaders/point-size.inc shaders/generate-point-size.py shaders/inout.vert shaders/inout.frag shaders/inout-match.frag shaders/inout-scalar.frag shaders/inout.inc shaders/generate-inout.py shaders/image-bounds.spvasm shaders/image-bounds.inc shaders/generate-image-bounds.py shaders/scaled.builtins.inc shaders/generate-unused-builtins.py shaders/widget-multi.vert shaders/widget-multi.frag shaders/widget-multi.vert.inc shaders/widget-multi.frag.inc shaders/generate-widget-multi.py shaders/bc-sample.comp shaders/bc-sample.inc shaders/generate-bc-sample.py shaders/scaled.divisor.vert shaders/scaled.divisor.inc shaders/group_decorations.py shaders/scaled.group.inc shaders/scaled.group-multi.inc shaders/scaled.group-spec.inc shaders/scaled.spec-direct.inc shaders/scaled.spec.vert shaders/scaled.spec.inc shaders/scaled.aggregate.vert shaders/scaled.matrix.inc shaders/scaled.array.inc shaders/scaled.nested.inc shaders/scaled.matarray.inc shaders/scaled.literal.inc shaders/generate-scaled.py shaders/scaled.multi.inc shaders/scaled.vert shaders/scaled.frag shaders/scaled.vert.inc shaders/scaled.frag.inc shaders/widget.vert shaders/widget.frag shaders/widget.vert.inc shaders/widget.frag.inc shaders/widget-large.vert.inc shaders/widget-large.frag.inc "$PROBE_SRC/shaders/"
+cp shaders/bc-sample-volume.inc "$PROBE_SRC/shaders/"
+cp shaders/primitive.vert shaders/primitive.geom shaders/primitive.inc shaders/generate-primitive.py "$PROBE_SRC/shaders/"
+cp shaders/packed.vert shaders/packed.inc shaders/generate-packed.py shaders/point-size.vert shaders/point-size.frag shaders/point-size.inc shaders/generate-point-size.py shaders/inout.vert shaders/inout.frag shaders/inout-match.frag shaders/inout-scalar.frag shaders/inout.inc shaders/generate-inout.py shaders/scaled.builtins.inc shaders/generate-unused-builtins.py shaders/widget-multi.vert shaders/widget-multi.frag shaders/widget-multi.vert.inc shaders/widget-multi.frag.inc shaders/generate-widget-multi.py shaders/bc-sample.comp shaders/bc-sample.inc shaders/generate-bc-sample.py shaders/scaled.divisor.vert shaders/scaled.divisor.inc shaders/group_decorations.py shaders/scaled.group.inc shaders/scaled.group-multi.inc shaders/scaled.group-spec.inc shaders/scaled.spec-direct.inc shaders/scaled.spec.vert shaders/scaled.spec.inc shaders/scaled.aggregate.vert shaders/scaled.matrix.inc shaders/scaled.array.inc shaders/scaled.nested.inc shaders/scaled.matarray.inc shaders/scaled.literal.inc shaders/generate-scaled.py shaders/scaled.multi.inc shaders/scaled.vert shaders/scaled.frag shaders/scaled.vert.inc shaders/scaled.frag.inc shaders/widget.vert shaders/widget.frag shaders/widget.vert.inc shaders/widget.frag.inc shaders/widget-large.vert.inc shaders/widget-large.frag.inc "$PROBE_SRC/shaders/"
 
 
 # Use the pinned repository toolchain unless the caller explicitly overrides it.
@@ -56,13 +61,13 @@ if [[ -z "${GLIBC_CC:-}" ]]; then
             --volume "$(cd "$BUNDLE" && pwd):/out:Z" \
             --volume "$HOST_HYBRIS:/hybris:Z" \
             --workdir /src "$BUILDER_ID" \
-            aarch64-linux-gnu-gcc -O2 -Wall -Wextra -pthread $cflags \
+            aarch64-linux-gnu-gcc -O2 -Wall -Wextra -pthread -Icompat $cflags \
             "${SOURCES[@]}" -ldl -lpthread ${libs//$HYBRIS_LIB//hybris} -o "/out/$(basename "$dest")"
     }
 else
     compile_glibc() {
         local cflags="$1" libs="$2" dest="$3"
-        (cd "$PROBE_SRC" && "$GLIBC_CC" -O2 -Wall -Wextra -pthread $cflags "${SOURCES[@]}" -ldl -lpthread $libs -o "$dest")
+        (cd "$PROBE_SRC" && "$GLIBC_CC" -O2 -Wall -Wextra -pthread -Icompat $cflags "${SOURCES[@]}" -ldl -lpthread $libs -o "$dest")
     }
 fi
 
@@ -70,7 +75,7 @@ compile_glibc "" "" "$BUNDLE/probe-glibc"
 compile_glibc "-DHYBRIS_PROBE_LINKED" \
     "-L$HYBRIS_LIB -Wl,-rpath-link,$HYBRIS_LIB -lvulkan" \
     "$BUNDLE/probe-glibc-linked"
-(cd "$PROBE_SRC" && "$BIONIC_CC" -O2 -Wall -Wextra -pthread "${SOURCES[@]}" -ldl -o "$BUNDLE/probe-bionic")
+(cd "$PROBE_SRC" && "$BIONIC_CC" -O2 -Wall -Wextra -pthread -Icompat "${SOURCES[@]}" -ldl -o "$BUNDLE/probe-bionic")
 (cd "$PROBE_SRC" && "$BIONIC_CC" -x c++ -std=c++11 -fPIC -shared -fno-exceptions -fno-rtti \
     tls_fixture.cpp -o "$BUNDLE/libtls-fixture.so")
 (cd "$PROBE_SRC" && "$BIONIC_CC" -x c++ -std=c++11 -fPIC -shared -fno-exceptions -fno-rtti \

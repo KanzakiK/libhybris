@@ -198,6 +198,44 @@ static void VKAPI_CALL push_constants(VkCommandBuffer handle, VkPipelineLayout l
     CmdPushConstants(handle, layout, stages, offset, size, values);
     if (device->format_mask) hybris_bc_save_push(&command->state, layout, stages, offset, size, values);
 }
+/* maintenance6 entry points also change the compute state temporarily used
+ * by the BC decoder. Forward the complete native command, then capture the
+ * same state as the original descriptor/push-constant entry points. */
+static void bind_descriptors2(VkCommandBuffer handle, const VkBindDescriptorSetsInfoKHR *info, const char *name)
+{
+    struct hybris_bc_device *device;
+    struct hybris_bc_command *command = hybris_bc_command_find(handle, &device);
+    if (!command) return;
+    PFN_vkCmdBindDescriptorSets2KHR bind = (PFN_vkCmdBindDescriptorSets2KHR)device->resolver(device->handle, name);
+    bind(handle, info);
+    if (device->format_mask && (info->stageFlags & VK_SHADER_STAGE_COMPUTE_BIT)) {
+        if (!info->layout) { command->state.error = VK_ERROR_FEATURE_NOT_PRESENT; return; }
+        hybris_bc_save_descriptors(&command->state, VK_PIPELINE_BIND_POINT_COMPUTE,
+            info->layout, info->firstSet, info->descriptorSetCount, info->pDescriptorSets,
+            info->dynamicOffsetCount, info->pDynamicOffsets);
+    }
+}
+static void VKAPI_CALL bind_descriptors2_khr(VkCommandBuffer handle, const VkBindDescriptorSetsInfoKHR *info)
+{ bind_descriptors2(handle, info, "vkCmdBindDescriptorSets2KHR"); }
+static void VKAPI_CALL bind_descriptors2_core(VkCommandBuffer handle, const VkBindDescriptorSetsInfoKHR *info)
+{ bind_descriptors2(handle, info, "vkCmdBindDescriptorSets2"); }
+static void push_constants2(VkCommandBuffer handle, const VkPushConstantsInfoKHR *info, const char *name)
+{
+    struct hybris_bc_device *device;
+    struct hybris_bc_command *command = hybris_bc_command_find(handle, &device);
+    if (!command) return;
+    PFN_vkCmdPushConstants2KHR push = (PFN_vkCmdPushConstants2KHR)device->resolver(device->handle, name);
+    push(handle, info);
+    if (device->format_mask) {
+        if (!info->layout) { command->state.error = VK_ERROR_FEATURE_NOT_PRESENT; return; }
+        hybris_bc_save_push(&command->state, info->layout, info->stageFlags,
+            info->offset, info->size, info->pValues);
+    }
+}
+static void VKAPI_CALL push_constants2_khr(VkCommandBuffer handle, const VkPushConstantsInfoKHR *info)
+{ push_constants2(handle, info, "vkCmdPushConstants2KHR"); }
+static void VKAPI_CALL push_constants2_core(VkCommandBuffer handle, const VkPushConstantsInfoKHR *info)
+{ push_constants2(handle, info, "vkCmdPushConstants2"); }
 PFN_vkVoidFunction hybris_bc_commands_proc(const char *name)
 {
     static const struct { const char *name; PFN_vkVoidFunction function; } commands[] = {
@@ -207,7 +245,9 @@ PFN_vkVoidFunction hybris_bc_commands_proc(const char *name)
         ENTRY(ResetCommandBuffer, reset_command), ENTRY(ResetCommandPool, reset_pool),
         ENTRY(DestroyCommandPool, destroy_pool), ENTRY(CreatePipelineLayout, create_layout),
         ENTRY(DestroyPipelineLayout, destroy_layout), ENTRY(CmdBindPipeline, bind_pipeline),
-        ENTRY(CmdBindDescriptorSets, bind_descriptors), ENTRY(CmdPushConstants, push_constants)
+        ENTRY(CmdBindDescriptorSets, bind_descriptors), ENTRY(CmdPushConstants, push_constants),
+        ENTRY(CmdBindDescriptorSets2KHR, bind_descriptors2_khr), ENTRY(CmdBindDescriptorSets2, bind_descriptors2_core),
+        ENTRY(CmdPushConstants2KHR, push_constants2_khr), ENTRY(CmdPushConstants2, push_constants2_core)
 #undef ENTRY
     };
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i)

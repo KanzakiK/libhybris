@@ -3,6 +3,7 @@
 #include "device_features.h"
 #include "../compat/vertex_stores.h"
 #include "../compat/clip_distance.h"
+#include "../compat/bc_policy.h"
 #include "../compat/scaled_vertex.h"
 #include <vulkan/vk_layer.h>
 #include <stdio.h>
@@ -36,19 +37,30 @@ VkResult hybris_device_features_prepare(VkPhysicalDevice physical,
     *out = (struct hybris_device_features){.info = *info};
     int clip = hybris_clip_active(physical);
     int stores = hybris_vertex_stores_active(physical);
-    if (!clip && !stores) return VK_SUCCESS;
+    int bc = hybris_bc_complete(physical);
+    int cull = hybris_cull_active(physical);
+    if (!clip && !stores && !bc && !cull) return VK_SUCCESS;
     if (info->pEnabledFeatures) {
         out->features = *info->pEnabledFeatures;
         if (clip) out->features.shaderClipDistance = VK_FALSE;
         if (stores) out->features.vertexPipelineStoresAndAtomics = VK_FALSE;
+        if (bc) out->features.textureCompressionBC = VK_FALSE;
+        if (cull) out->features.geometryShader = VK_TRUE;
         out->info.pEnabledFeatures = &out->features;
     }
     const VkBaseInStructure *target = info->pNext;
     while (target && target->sType != VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
         target = target->pNext;
-    if (!target) return VK_SUCCESS;
+    if (!target) {
+        if (cull && !info->pEnabledFeatures) {
+            out->features = (VkPhysicalDeviceFeatures){.geometryShader = VK_TRUE};
+            out->info.pEnabledFeatures = &out->features;
+        }
+        return VK_SUCCESS;
+    }
     const VkPhysicalDeviceFeatures *requested = &((const VkPhysicalDeviceFeatures2 *)target)->features;
-    if (!(clip && requested->shaderClipDistance) && !(stores && requested->vertexPipelineStoresAndAtomics))
+    if (!(clip && requested->shaderClipDistance) && !(stores && requested->vertexPipelineStoresAndAtomics) &&
+        !(bc && requested->textureCompressionBC) && !(cull && !requested->geometryShader))
         return VK_SUCCESS;
 
     /* Only copy the prefix needed to replace Features2. Preserve every other
@@ -75,6 +87,8 @@ VkResult hybris_device_features_prepare(VkPhysicalDevice physical,
         if (node == target) {
             if (clip) ((VkPhysicalDeviceFeatures2 *)copy)->features.shaderClipDistance = VK_FALSE;
             if (stores) ((VkPhysicalDeviceFeatures2 *)copy)->features.vertexPipelineStoresAndAtomics = VK_FALSE;
+            if (bc) ((VkPhysicalDeviceFeatures2 *)copy)->features.textureCompressionBC = VK_FALSE;
+            if (cull) ((VkPhysicalDeviceFeatures2 *)copy)->features.geometryShader = VK_TRUE;
             copy->pNext = (void *)out->suffix;
             break;
         }

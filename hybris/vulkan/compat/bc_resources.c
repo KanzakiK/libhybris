@@ -165,12 +165,14 @@ static VkResult bind_images(VkDevice handle, uint32_t count, const VkBindImageMe
             if (next->sType == VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_DEVICE_GROUP_INFO) {
                 const VkBindImageMemoryDeviceGroupInfo *group = (const void *)next;
                 if (group->splitInstanceBindRegionCount) return VK_ERROR_FEATURE_NOT_PRESENT;
-            } else if (next->sType != VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR) {
+            } else if (next->sType != VK_STRUCTURE_TYPE_BIND_IMAGE_MEMORY_SWAPCHAIN_INFO_KHR &&
+                       next->sType != VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS_KHR) {
                 return VK_ERROR_FEATURE_NOT_PRESENT;
             }
         }
     }
     PFN_vkBindImageMemory2 bind = (PFN_vkBindImageMemory2)device->resolver(handle, name);
+    VkResult overall = VK_SUCCESS;
     for (uint32_t i = 0; i < count; ++i) {
         struct hybris_bc_resource *resource = hybris_bc_resource_find(device, infos[i].image);
         VkResult result;
@@ -191,12 +193,21 @@ static VkResult bind_images(VkDevice handle, uint32_t count, const VkBindImageMe
                 "vkBindBufferMemory2KHR" : "vkBindBufferMemory2";
             PFN_vkBindBufferMemory2 bind_buffer = (PFN_vkBindBufferMemory2)device->resolver(handle, buffer_name);
             result = bind_buffer(handle, 1, &buffer);
+            /* Report the actual compressed-backing binding, not the private
+             * decoded image's earlier allocation. */
+            for (const VkBaseInStructure *next = infos[i].pNext; next; next = next->pNext)
+                if (next->sType == VK_STRUCTURE_TYPE_BIND_MEMORY_STATUS_KHR) {
+                    const VkBindMemoryStatusKHR *status = (const void *)next;
+                    if (status->pResult) *status->pResult = result;
+                }
         } else {
             result = bind(handle, 1, &infos[i]);
         }
-        if (result != VK_SUCCESS) return result;
+        /* maintenance6 requires every binding to be attempted. Doing so is
+         * also legal without that feature. */
+        if (result != VK_SUCCESS) overall = result;
     }
-    return VK_SUCCESS;
+    return overall;
 }
 static VkResult VKAPI_CALL bind_images_core(VkDevice handle, uint32_t count, const VkBindImageMemoryInfo *infos)
 { return bind_images(handle, count, infos, "vkBindImageMemory2"); }
@@ -210,8 +221,10 @@ static VkResult VKAPI_CALL create_view(VkDevice handle, const VkImageViewCreateI
     struct hybris_bc_resource *resource = hybris_bc_resource_find(device, info->image);
     VkImageViewCreateInfo translated = *info;
     if (resource && resource->emulated.image) {
-        if (info->format != resource->format) return VK_ERROR_FORMAT_NOT_SUPPORTED;
-        translated.format = resource->emulated.decoded_format;
+        if (!hybris_bc_view_format_allowed(resource->format, info->format, resource->emulated.flags))
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        translated.format = (resource->emulated.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ?
+            hybris_bc_image_format(info->format, 0) : resource->emulated.decoded_format;
     }
     PROC(CreateImageView);
     return CreateImageView(handle, &translated, allocator, view);

@@ -14,6 +14,18 @@ def number(value):
     return int(value, 0) if isinstance(value, str) else int(value)
 
 
+def struct_array(value):
+    # Trim-state reconstruction can encode a one-element struct array as an
+    # object (e.g. synthesized vkQueueSubmit), unlike ordinary captured calls.
+    if value is None:
+        return []
+    if isinstance(value, dict):
+        return [value]
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError('expected a struct array or a singleton struct object')
+    return value
+
+
 def registry_commands(path):
     commands = {}
     aliases = {}
@@ -73,7 +85,7 @@ def inspect_batch(submit_index, batch_index, recordings, commands, views, images
                 flags = number(info['flags'])
                 scope = {'begin_index': index, 'command_buffer': handle,
                          'flags': flags, 'rendering_info': info, 'attachments': [], 'draws': []}
-                for attachment in (info.get('pColorAttachments') or []) + [
+                for attachment in struct_array(info.get('pColorAttachments')) + [
                         info.get('pDepthAttachment'), info.get('pStencilAttachment')]:
                     if not attachment or not attachment.get('imageView'):
                         continue
@@ -225,9 +237,9 @@ def inspect(path, registry):
                 result['uncovered'].append({'index': index, 'command': name,
                                             'reason': 'recording start is unavailable'})
         elif name in ('vkQueueSubmit', 'vkQueueSubmit2', 'vkQueueSubmit2KHR'):
-            for batch_index, batch in enumerate(args.get('pSubmits') or []):
+            for batch_index, batch in enumerate(struct_array(args.get('pSubmits'))):
                 handles = (batch.get('pCommandBuffers') or []) if name == 'vkQueueSubmit' else [
-                    item['commandBuffer'] for item in batch.get('pCommandBufferInfos') or []]
+                    item['commandBuffer'] for item in struct_array(batch.get('pCommandBufferInfos'))]
                 for handle in handles:
                     if handle in recordings:
                         recordings[handle]['captured_submit'] = True

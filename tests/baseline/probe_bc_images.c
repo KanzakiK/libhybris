@@ -2,6 +2,7 @@
 #include "bc_image_verify.h"
 #define BC_IMAGE_FORMAT_COUNT BC_FORMAT_COUNT
 #include "shaders/bc-sample.inc"
+#include "shaders/bc-sample-volume.inc"
 
 static void image_barrier(PFN_vkCmdPipelineBarrier barrier, VkCommandBuffer command, VkImage image,
     uint32_t mip, uint32_t layers, VkImageLayout before, VkImageLayout after,
@@ -41,8 +42,12 @@ static void image_event(PFN_vkCmdSetEvent set, PFN_vkCmdWaitEvents wait,
             0, NULL, 0, NULL, 1, &barrier);
     }
 }
-int bc_images_probe(int validate, int route)
+int bc_images_probe(int validate, int route, int blit_mode)
 {
+    int blit_reference = blit_mode == 1 || blit_mode == 2;
+    int blit_scale = blit_mode == 2;
+    int maintenance6_requested = blit_mode == 3;
+    int volume = blit_mode == 4;
     void *h = dlopen(getenv("PROBE_VK") ?: "libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
     if (!h) return 2;
     PFN_vkGetInstanceProcAddr gip = sym(h, "vkGetInstanceProcAddr");
@@ -100,11 +105,20 @@ int bc_images_probe(int validate, int route)
     for (unsigned f = 0; f < BC_IMAGE_FORMAT_COUNT; ++f) {
         VkFormatProperties format;
         p_vkGetPhysicalDeviceFormatProperties(physical, bc_formats[f], &format);
+        if (blit_reference && !(format.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_SRC_BIT)) {
+            printf("BC_IMAGES_BLIT_UNSUPPORTED format=%u\n", bc_formats[f]);
+            return 3;
+        }
+        if (blit_reference) {
+            VkFormatProperties destination;
+            p_vkGetPhysicalDeviceFormatProperties(physical, bc_reference_format(f), &destination);
+            if (!(destination.optimalTilingFeatures & VK_FORMAT_FEATURE_BLIT_DST_BIT)) return 3;
+        }
         VkFormatProperties2 format2 = {.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
         p_vkGetPhysicalDeviceFormatProperties2(physical, bc_formats[f], &format2);
         if (memcmp(&format, &format2.formatProperties, sizeof(format))) return 2;
         VkImageFormatProperties image;
-        result = p_vkGetPhysicalDeviceImageFormatProperties(physical, bc_formats[f], VK_IMAGE_TYPE_2D,
+        result = p_vkGetPhysicalDeviceImageFormatProperties(physical, bc_formats[f], volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D,
             VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
             VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0, &image);
         printf("BC_IMAGES_FORMAT format=%u optimal=%u image_result=%d\n", bc_formats[f], format.optimalTilingFeatures, result);
@@ -127,7 +141,7 @@ int bc_images_probe(int validate, int route)
             if (sparse_count) return 2;
         }
         VkPhysicalDeviceImageFormatInfo2 query = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
-            .format = bc_formats[f], .type = VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_OPTIMAL,
+            .format = bc_formats[f], .type = volume ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, .tiling = VK_IMAGE_TILING_OPTIMAL,
             .usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT};
         VkImageFormatProperties2 image2 = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2};
         CHECK(p_vkGetPhysicalDeviceImageFormatProperties2(physical, &query, &image2));
@@ -143,11 +157,12 @@ int bc_images_probe(int validate, int route)
     VkExtensionProperties *available = calloc(extension_count, sizeof(*available));
     if (!available) return 2;
     CHECK(p_vkEnumerateDeviceExtensionProperties(physical, NULL, &extension_count, available));
-    int copies2 = 0, sync2 = 0, maintenance4 = 0, format_list = 0;
+    int copies2 = 0, sync2 = 0, maintenance4 = 0, maintenance6 = 0, format_list = 0;
     for (uint32_t i = 0; i < extension_count; ++i) {
         if (!strcmp(available[i].extensionName, VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME)) copies2 = 1;
         if (!strcmp(available[i].extensionName, VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME)) sync2 = 1;
         if (!strcmp(available[i].extensionName, VK_KHR_MAINTENANCE_4_EXTENSION_NAME)) maintenance4 = 1;
+        if (!strcmp(available[i].extensionName, VK_KHR_MAINTENANCE_6_EXTENSION_NAME)) maintenance6 = 1;
         if (!strcmp(available[i].extensionName, VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME)) format_list = 1;
     }
     free(available);
@@ -164,20 +179,40 @@ int bc_images_probe(int validate, int route)
         p_vkGetPhysicalDeviceFeatures2(physical, &queried);
         maintenance4 = maintenance.maintenance4;
     }
-    synchronization.pNext = maintenance4 ? &maintenance : NULL;
-    const char *device_extensions[4];
+    VkPhysicalDeviceMaintenance6FeaturesKHR maintenance_six = {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_6_FEATURES_KHR};
+    if (maintenance6 && maintenance6_requested) {
+        VkPhysicalDeviceFeatures2 queried = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &maintenance_six};
+        p_vkGetPhysicalDeviceFeatures2(physical, &queried);
+        maintenance6 = maintenance_six.maintenance6;
+    } else maintenance6 = 0;
+    if (maintenance6_requested && !maintenance6) {
+        puts("BC_IMAGES_UNSUPPORTED maintenance6");
+        p_vkDestroyInstance(instance, NULL);
+        return 3;
+    }
+    maintenance.pNext = maintenance6 ? &maintenance_six : NULL;
+    synchronization.pNext = maintenance4 ? (void *)&maintenance : maintenance.pNext;
+    const char *device_extensions[5];
     uint32_t device_extension_count = 0;
     if (copies2) device_extensions[device_extension_count++] = VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME;
     if (sync2) device_extensions[device_extension_count++] = VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME;
     if (maintenance4) device_extensions[device_extension_count++] = VK_KHR_MAINTENANCE_4_EXTENSION_NAME;
+    if (maintenance6) device_extensions[device_extension_count++] = VK_KHR_MAINTENANCE_6_EXTENSION_NAME;
     if (format_list) device_extensions[device_extension_count++] = VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME;
     float priority = 1;
     VkDeviceQueueCreateInfo qc = {.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
         .queueFamilyIndex = family, .queueCount = 1, .pQueuePriorities = &priority};
     VkDeviceCreateInfo dc = {.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
         .queueCreateInfoCount = 1, .pQueueCreateInfos = &qc,
-        .pNext = sync2 ? (void *)&synchronization : maintenance4 ? (void *)&maintenance : NULL,
+        .pNext = sync2 ? (void *)&synchronization : synchronization.pNext,
         .enabledExtensionCount = device_extension_count, .ppEnabledExtensionNames = device_extensions};
+    VkPhysicalDeviceFeatures core_enabled = {.textureCompressionBC = features.textureCompressionBC};
+    VkPhysicalDeviceFeatures2 enabled2 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+        .pNext = (void *)dc.pNext, .features = core_enabled};
+    if (maintenance6_requested) dc.pNext = &enabled2;
+    else dc.pEnabledFeatures = &core_enabled;
     VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
     PFN_vkDestroyDebugUtilsMessengerEXT destroy_messenger = NULL;
     if (validate) {
@@ -207,6 +242,7 @@ int bc_images_probe(int validate, int route)
     D(vkCreateShaderModule); D(vkDestroyShaderModule); D(vkCreatePipelineLayout); D(vkDestroyPipelineLayout);
     D(vkCreateComputePipelines); D(vkDestroyPipeline); D(vkCmdBindPipeline); D(vkCmdBindDescriptorSets);
     D(vkCmdPushConstants); D(vkCmdDispatch); D(vkCmdCopyBufferToImage); D(vkCmdCopyImage); D(vkCmdCopyImageToBuffer);
+    D(vkCmdBlitImage);
     D(vkCreateCommandPool); D(vkDestroyCommandPool); D(vkAllocateCommandBuffers); D(vkBeginCommandBuffer);
     D(vkEndCommandBuffer); D(vkResetCommandBuffer); D(vkResetCommandPool); D(vkFreeCommandBuffers);
     D(vkCmdFillBuffer); D(vkCmdPipelineBarrier);
@@ -240,6 +276,7 @@ int bc_images_probe(int validate, int route)
     VkQueue queue;
     p_vkGetDeviceQueue(device, family, 0, &queue);
     enum { BYTES = 524288, RAW = 393216, REFERENCE = 65536, OUTPUT = 262144, LAYERS = 3 };
+    uint32_t bc_layers = volume ? 1 : LAYERS;
     VkBuffer buffers[2]; VkDeviceMemory buffer_memory[2]; VkDeviceSize binding[2]; uint8_t *mapped[2];
     for (unsigned i = 0; i < 2; ++i) {
         VkBufferCreateInfo bi = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO, .size = BYTES,
@@ -293,7 +330,8 @@ int bc_images_probe(int validate, int route)
     sampler_info.borderColor = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK;
     CHECK(p_vkCreateSampler(device, &sampler_info, NULL, &samplers[4]));
     VkShaderModuleCreateInfo shader_info = {.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-        .codeSize = sizeof(bc_sample_spv), .pCode = bc_sample_spv};
+        .codeSize = volume ? sizeof(bc_sample_volume_spv) : sizeof(bc_sample_spv),
+        .pCode = volume ? bc_sample_volume_spv : bc_sample_spv};
     VkShaderModule shader;
     CHECK(p_vkCreateShaderModule(device, &shader_info, NULL, &shader));
     VkCommandPoolCreateInfo pool_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -324,17 +362,28 @@ int bc_images_probe(int validate, int route)
             /* Legacy opaque-black sampling with nonidentity swizzles is undefined. */
             unsigned view_swizzled = shape_index && sampler_choice != 4;
             uint32_t block_bytes = bc_block_bytes(mode);
-            VkImage images[4]; VkDeviceMemory image_memory[4];
-            for (unsigned i = 0; i < 4; ++i) {
+            VkImage images[5]; VkDeviceMemory image_memory[5];
+            unsigned image_count = blit_scale ? 5 : 4;
+            for (unsigned i = 0; i < image_count; ++i) {
                 VkImageCreateInfo image_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
                     .imageType = i == 2 && shape_index ? VK_IMAGE_TYPE_3D : VK_IMAGE_TYPE_2D, .format = i == 2 ?
                         (block_bytes == 8 ? VK_FORMAT_R32G32_UINT : VK_FORMAT_R32G32B32A32_UINT) :
-                        i == 3 ? bc_reference_format(f) : bc_formats[f],
+                        i >= 3 ? bc_reference_format(f) : bc_formats[f],
                     .extent = i == 2 ? (VkExtent3D){(width + 3) / 4, (height + 3) / 4, shape_index ? LAYERS : 1} :
-                        i == 3 ? (VkExtent3D){width, height, 1} : (VkExtent3D){base_width, base_height, 1},
+                        i >= 3 ? (VkExtent3D){width * (i == 4 ? 2 : 1), height * (i == 4 ? 2 : 1), 1} : (VkExtent3D){base_width, base_height, 1},
                     .mipLevels = i >= 2 ? 1 : 4, .arrayLayers = i == 2 && shape_index ? 1 : LAYERS, .samples = VK_SAMPLE_COUNT_1_BIT,
                     .tiling = VK_IMAGE_TILING_OPTIMAL, .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                         (i != 2 ? VK_IMAGE_USAGE_SAMPLED_BIT : 0), .sharingMode = VK_SHARING_MODE_EXCLUSIVE};
+                if (volume && i < 2) {
+                    image_info.imageType = VK_IMAGE_TYPE_3D;
+                    image_info.extent.depth = LAYERS << mip;
+                    image_info.arrayLayers = 1;
+                }
+                if (volume && i == 3) {
+                    image_info.imageType = VK_IMAGE_TYPE_3D;
+                    image_info.extent.depth = LAYERS;
+                    image_info.arrayLayers = 1;
+                }
                 VkImageFormatListCreateInfo formats = {.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
                     .viewFormatCount = 1, .pViewFormats = &image_info.format};
                 if (format_list) image_info.pNext = &formats;
@@ -377,13 +426,15 @@ int bc_images_probe(int validate, int route)
                 CHECK(p_vkBindImageMemory2(device, 1, &bind));
             }
             VkImageViewCreateInfo view_info = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
-                .image = images[1], .viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY, .format = bc_formats[f],
-                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, LAYERS}};
+                .image = images[1], .viewType = volume ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D_ARRAY, .format = bc_formats[f],
+                .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, bc_layers}};
             if (view_swizzled) view_info.components = (VkComponentMapping){
                 VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_A};
             VkImageView view;
             CHECK(p_vkCreateImageView(device, &view_info, NULL, &view));
             view_info.image = images[3];
+            view_info.viewType = volume ? VK_IMAGE_VIEW_TYPE_3D : VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+            view_info.subresourceRange.layerCount = volume ? 1 : LAYERS;
             view_info.format = bc_reference_format(f);
             /* BC1 RGB and BC6H have no alpha, including outside the image. */
             if ((f < 2 || f >= 14) && sampler_choice != 4) view_info.components.a = VK_COMPONENT_SWIZZLE_ONE;
@@ -414,9 +465,26 @@ int bc_images_probe(int validate, int route)
             VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             CHECK(p_vkBeginCommandBuffer(command, &begin));
             p_vkCmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-            p_vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &descriptors, 1, &dynamic_offset);
             uint32_t shape[] = {width, height, LAYERS, f >= 14 ? 3 : f >= 8 && f < 12 ? 1 + (f & 1) : 0, linear_filter[f] != 0};
-            p_vkCmdPushConstants(command, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shape), shape);
+            if (maintenance6) {
+                PFN_vkCmdBindDescriptorSets2KHR bind2 = (PFN_vkCmdBindDescriptorSets2KHR)
+                    p_vkGetDeviceProcAddr(device, "vkCmdBindDescriptorSets2KHR");
+                PFN_vkCmdPushConstants2KHR push2 = (PFN_vkCmdPushConstants2KHR)
+                    p_vkGetDeviceProcAddr(device, "vkCmdPushConstants2KHR");
+                if (!bind2 || !push2) return 2;
+                VkBindDescriptorSetsInfoKHR binding = {.sType = VK_STRUCTURE_TYPE_BIND_DESCRIPTOR_SETS_INFO_KHR,
+                    .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT, .layout = pipeline_layout,
+                    .descriptorSetCount = 1, .pDescriptorSets = &descriptors,
+                    .dynamicOffsetCount = 1, .pDynamicOffsets = &dynamic_offset};
+                VkPushConstantsInfoKHR push = {.sType = VK_STRUCTURE_TYPE_PUSH_CONSTANTS_INFO_KHR,
+                    .layout = pipeline_layout, .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+                    .size = sizeof(shape), .pValues = shape};
+                bind2(command, &binding);
+                push2(command, &push);
+            } else {
+                p_vkCmdBindDescriptorSets(command, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_layout, 0, 1, &descriptors, 1, &dynamic_offset);
+                p_vkCmdPushConstants(command, pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(shape), shape);
+            }
             VkMemoryBarrier before = {.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
@@ -427,18 +495,22 @@ int bc_images_probe(int validate, int route)
                 .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT};
             p_vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
                 0, 1, &filled, 0, NULL, 0, NULL);
-            for (unsigned i = 0; i < 4; ++i)
-                image_barrier(p_vkCmdPipelineBarrier, command, images[i], i >= 2 ? 0 : mip, i == 2 && shape_index ? 1 : LAYERS,
+            for (unsigned i = 0; i < image_count; ++i)
+                image_barrier(p_vkCmdPipelineBarrier, command, images[i], i >= 2 ? 0 : mip,
+                    i < 2 ? bc_layers : (i == 2 && shape_index) || (volume && i == 3) ? 1 : LAYERS,
                     VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
             VkBufferImageCopy reference_upload = {.bufferOffset = REFERENCE,
-                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, LAYERS}, .imageExtent = {width, height, 1}};
-            p_vkCmdCopyBufferToImage(command, buffers[0], images[3], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reference_upload);
-            image_barrier(p_vkCmdPipelineBarrier, command, images[3], 0, LAYERS,
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, volume ? 1 : LAYERS},
+                .imageExtent = {width, height, volume ? LAYERS : 1}};
+            if (!blit_reference) {
+                p_vkCmdCopyBufferToImage(command, buffers[0], images[3], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &reference_upload);
+                image_barrier(p_vkCmdPipelineBarrier, command, images[3], 0, volume ? 1 : LAYERS,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+            }
             VkBufferImageCopy upload = {.bufferOffset = 16, .bufferRowLength = 40, .bufferImageHeight = 36,
-                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, LAYERS}, .imageExtent = {width, height, 1}};
+                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0, bc_layers}, .imageExtent = {width, height, volume ? LAYERS : 1}};
             if (use2) {
                 VkBufferImageCopy2 region = {.sType = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
                     .bufferOffset = upload.bufferOffset, .bufferRowLength = upload.bufferRowLength,
@@ -456,17 +528,51 @@ int bc_images_probe(int validate, int route)
                     .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT, .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT};
                 p_vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     0, 1, &ready, 0, NULL, 0, NULL);
-                image_barrier(p_vkCmdPipelineBarrier, command, images[0], mip, LAYERS,
+                image_barrier(p_vkCmdPipelineBarrier, command, images[0], mip, bc_layers,
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
                 VkBufferImageCopy patch = {.bufferOffset = 8192, .bufferRowLength = 8, .bufferImageHeight = 8,
-                    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 1},
-                    .imageOffset = {4, 0, 0}, .imageExtent = {4, 4, 1}};
+                    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, volume ? 0 : 1, 1},
+                    .imageOffset = {4, 0, volume ? 1 : 0}, .imageExtent = {4, 4, 1}};
                 p_vkCmdCopyBufferToImage(command, buffers[0], images[0], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &patch);
             }
             image_event(p_vkCmdSetEvent, p_vkCmdWaitEvents, set_event2, wait_events2,
-                command, event, images[0], mip, LAYERS, use_sync2);
+                command, event, images[0], mip, bc_layers, use_sync2);
+            if (blit_reference) {
+                /* Keep the CPU golden checks, but construct the sampled
+                 * reference via a BC -> native GPU blit instead of upload.
+                 * Exercise nearest/linear, all mips and array layers. */
+                VkImageBlit blit = {.srcSubresource = upload.imageSubresource,
+                    .srcOffsets = {{0, 0, 0}, {(int32_t)width, (int32_t)height, 1}},
+                    .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, LAYERS},
+                    .dstOffsets = {{0, 0, 0}, {(int32_t)width, (int32_t)height, 1}}};
+                if (blit_scale) {
+                    /* Magnify and reverse both axes, then reduce/reverse back.
+                     * Nearest enlargement produces identical 2x2 texel groups;
+                     * either reduction filter must preserve the CPU golden. */
+                    blit.dstOffsets[0] = (VkOffset3D){(int32_t)width * 2, (int32_t)height * 2, 0};
+                    blit.dstOffsets[1] = (VkOffset3D){0, 0, 1};
+                    p_vkCmdBlitImage(command, images[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        images[4], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit, VK_FILTER_NEAREST);
+                    image_barrier(p_vkCmdPipelineBarrier, command, images[4], 0, LAYERS,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+                    blit.srcSubresource = blit.dstSubresource;
+                    blit.srcOffsets[0] = blit.dstOffsets[0];
+                    blit.srcOffsets[1] = blit.dstOffsets[1];
+                    blit.dstOffsets[0] = (VkOffset3D){0, 0, 0};
+                    blit.dstOffsets[1] = (VkOffset3D){(int32_t)width, (int32_t)height, 1};
+                }
+                p_vkCmdBlitImage(command, images[blit_scale ? 4 : 0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    images[3], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blit,
+                    (mip & 1) && linear_filter[f] ? VK_FILTER_LINEAR : VK_FILTER_NEAREST);
+                image_barrier(p_vkCmdPipelineBarrier, command, images[3], 0, LAYERS,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
+            }
             VkImageCopy copy_region = {.srcSubresource = upload.imageSubresource,
                 .dstSubresource = upload.imageSubresource, .extent = upload.imageExtent};
             if (use2) {
@@ -478,26 +584,27 @@ int bc_images_probe(int validate, int route)
                 copy_image2(command, &copy);
             } else p_vkCmdCopyImage(command, images[0], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 images[1], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
-            image_barrier(p_vkCmdPipelineBarrier, command, images[1], mip, LAYERS,
+            image_barrier(p_vkCmdPipelineBarrier, command, images[1], mip, bc_layers,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             copy_region.dstSubresource.mipLevel = 0;
+            copy_region.dstSubresource.layerCount = shape_index ? 1 : LAYERS;
             if (shape_index) { copy_region.dstSubresource.layerCount = 1; copy_region.extent.depth = LAYERS; }
             p_vkCmdCopyImage(command, images[1], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 images[2], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
             image_barrier(p_vkCmdPipelineBarrier, command, images[2], 0, shape_index ? 1 : LAYERS,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-            image_barrier(p_vkCmdPipelineBarrier, command, images[1], mip, LAYERS,
+            image_barrier(p_vkCmdPipelineBarrier, command, images[1], mip, bc_layers,
                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
             copy_region.srcSubresource.mipLevel = 0;
             copy_region.srcSubresource.layerCount = shape_index ? 1 : LAYERS;
             copy_region.dstSubresource.mipLevel = mip;
-            copy_region.dstSubresource.layerCount = LAYERS;
+            copy_region.dstSubresource.layerCount = bc_layers;
             /* A native texel expands to a whole 4x4 destination block. Only
              * full blocks fit; compressed edge texels were copied BC-to-BC. */
-            copy_region.extent = (VkExtent3D){width / 4, height / 4, shape_index ? LAYERS : 1};
+            copy_region.extent = (VkExtent3D){width / 4, height / 4, (shape_index || volume) ? LAYERS : 1};
             if (copy_region.extent.width && copy_region.extent.height)
                 p_vkCmdCopyImage(command, images[2], VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                     images[1], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
@@ -507,16 +614,16 @@ int bc_images_probe(int validate, int route)
                     .dstStageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, .dstAccessMask = VK_ACCESS_2_SHADER_READ_BIT,
                     .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                     .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED, .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                    .image = images[1], .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, LAYERS}};
+                    .image = images[1], .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1, 0, bc_layers}};
                 VkDependencyInfo dependency = {.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
                     .imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &barrier};
                 pipeline_barrier2(command, &dependency);
-            } else image_barrier(p_vkCmdPipelineBarrier, command, images[1], mip, LAYERS,
+            } else image_barrier(p_vkCmdPipelineBarrier, command, images[1], mip, bc_layers,
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                 VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT);
             /* No application rebind after any injected decoder dispatch. */
             p_vkCmdDispatch(command, (width * height * LAYERS + 63) / 64, 1, 1);
-            image_barrier(p_vkCmdPipelineBarrier, command, images[1], mip, LAYERS,
+            image_barrier(p_vkCmdPipelineBarrier, command, images[1], mip, bc_layers,
                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             VkBufferImageCopy download = {.bufferOffset = RAW, .imageSubresource = upload.imageSubresource, .imageExtent = upload.imageExtent};
@@ -576,7 +683,7 @@ int bc_images_probe(int validate, int route)
                     .region = fixture, .bytes = BYTES, .dynamic_offset = dynamic_offset,
                     .raw_offset = RAW, .reference_offset = REFERENCE, .format = f, .round = round,
                     .swizzle = view_swizzled, .patched = patched, .filtering = linear_filter[f],
-                    .sampler_choice = sampler_choice};
+                    .sampler_choice = sampler_choice, .depth_filter = volume};
                 unsigned bad = bc_verify_image_readback(&check);
                 printf("BC_IMAGES_READBACK format=%u shape=%u mip=%u round=%u copy2=%u sync2=%u gpu_patch=%u linear_filter=%u border=%u pixels=%u raw_bytes=%u bad=%u\n",
                     bc_formats[f], shape_index, mip, round, use2, use_sync2, patched, linear_filter[f] != 0, sampler_choice >= 2 ? sampler_choice - 1 : 0, pixels, raw_size, bad);
@@ -592,7 +699,7 @@ int bc_images_probe(int validate, int route)
             p_vkDestroyPipeline(device, pipeline, NULL);
             p_vkDestroyImageView(device, view, NULL);
             p_vkDestroyImageView(device, reference_view, NULL);
-            for (unsigned i = 0; i < 4; ++i) {
+            for (unsigned i = 0; i < image_count; ++i) {
                 p_vkDestroyImage(device, images[i], NULL);
                 p_vkFreeMemory(device, image_memory[i], NULL);
             }
@@ -614,7 +721,7 @@ int bc_images_probe(int validate, int route)
     p_vkDestroyDevice(device, NULL);
     if (destroy_messenger) destroy_messenger(instance, messenger, NULL);
     p_vkDestroyInstance(instance, NULL); dlclose(h);
-    printf("BC_IMAGES_SUMMARY formats=16 shapes=2 readbacks=%u copy2_cases=%u sync2_cases=%u maintenance4=%u format_list=%u failures=%u validation_errors=%u route=%d\n",
-        readbacks, copies2_cases, sync2_cases, maintenance4, format_list, failures, validation.errors, route);
+    printf("BC_IMAGES_SUMMARY formats=16 shapes=2 readbacks=%u copy2_cases=%u sync2_cases=%u maintenance4=%u maintenance6=%u format_list=%u failures=%u validation_errors=%u route=%d blit_reference=%d blit_scale=%d volume=%d\n",
+        readbacks, copies2_cases, sync2_cases, maintenance4, maintenance6, format_list, failures, validation.errors, route, blit_reference, blit_scale, volume);
     return failures || validation.errors || readbacks != BC_IMAGE_FORMAT_COUNT * 2 * 4 * 3 ? 2 : 0;
 }

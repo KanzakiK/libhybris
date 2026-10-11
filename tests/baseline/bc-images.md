@@ -12,9 +12,10 @@ probe passes on Mali and exposes an unresolved Redmi alpha failure; see the
 
 ## Policy and supported domain
 
-The default is off. `HYBRIS_BC_TEXTURES=missing` selects BC1 RGB/RGBA, BC2 and
-BC3/BC7 UNORM/sRGB and BC4/BC5 UNORM/SNORM formats lacking native optimal
-sampled-image support. `force` selects the same fourteen formats for development comparisons. Environment options
+The default is `missing`. `HYBRIS_BC_TEXTURES=missing` selects BC1 RGB/RGBA,
+BC2/BC3/BC7 UNORM/sRGB, BC4/BC5 UNORM/SNORM and BC6H UFLOAT/SFLOAT formats
+lacking native optimal sampled-image support. `force` selects all sixteen
+formats for development comparisons. Environment options
 are ignored in secure execution and read once per process.
 
 The initial fallback requires an application requesting Vulkan 1.1 or newer,
@@ -23,23 +24,27 @@ transfer granularity on every transfer-capable queue family. Unsupported
 physical devices keep their native format behavior. Vulkan 1.4's additional
 state commands are not covered yet.
 
-Selected formats support optimal 2D images, single sampling, mip levels, array
-layers and cube-compatible creation, with sampled/transfer usage. Linear,
-sparse, mutable, storage, attachment, external-memory and host-copy images
+Selected formats support optimal 2D and 3D images, single sampling and mip levels,
+with sampled/transfer usage. 2D images also support array layers and cubes.
+BC1/BC2/BC3/BC7 allow mutable UNORM/sRGB views within their format pair.
+Linear, sparse, other mutable reinterpretations, storage, attachment, external-memory and host-copy images
 are not advertised. Sparse format and maintenance4 sparse-memory queries return
 no requirements for selected emulated formats. The image-format queries use the corresponding native
-RGB8, RGBA8, R16 or RG16 format's limits and restrict sample counts and usages consistently.
-Format properties expose only sampled, linear-filter and transfer support.
-`textureCompressionBC` remains false: that feature promises the complete BC
-family, including capabilities this fallback does not implement. Individual
-formats can be queried separately, as described by
+RGB8, RGBA8, R16, RG16 or RGB/RGBA16F format's limits and restrict sample counts
+and usages consistently. Format properties expose sampled, linear-filter,
+transfer and source-blit support when available in the backing format.
+`textureCompressionBC` is advertised only when all sixteen formats satisfy
+the required sampled, linear-filtered and source-blit domain for 2D and 3D
+images. Missing native RGB backing also prevents the flag from being raised,
+so absent-alpha and border behavior are preserved. Individual optional image
+creation flags and view reinterpretations must still be queried separately, as described by
 [VkPhysicalDeviceFeatures](https://docs.vulkan.org/refpages/latest/refpages/source/VkPhysicalDeviceFeatures.html).
 
 When emulation is active, pipeline statistics and protected memory are disabled;
 protected queue flags are removed too. Injected compute must not contaminate
 application pipeline-statistics queries. Unsupported descriptor-state and
 related extensions are excluded from enumeration and rejected at device
-creation: descriptor buffer, push descriptor, shader object, maintenance6/8,
+creation: descriptor buffer, push descriptor, shader object, maintenance8,
 host image copy, QCOM rotated copy, EXT/NV generated commands (including NV
 compute generated commands), NV indirect memory copy, and NV dedicated allocation. Feature queries for
 the excluded feature structures agree with these decisions. These restrictions
@@ -94,6 +99,130 @@ registries, resource entry points, image copies, barriers and capability policy.
 The existing scaled-vertex implementation retains its own shader/pipeline hooks.
 
 ## Probe and reproduction
+
+### Core BC feature enablement (2026-10-11)
+
+The capability predicate checks the complete required format domain, not just
+the decoder mask. `bc-feature-policy.c` verifies that missing linear filtering,
+source blits, RGB backing, 3D support or single-sample support keeps the feature
+disabled. At device creation, the compatibility layer consumes the emulated
+BC feature using the same immutable input-chain copy used for other emulated
+features; the native driver receives its own supported feature set.
+
+On x300, the normal-build layer
+`f19eec2c306a1da4bdc9a30a8b9423625606c0050f01ad7a33f8b44a01a0db07`
+reports `compression_bc=1`. The volume probe enables BC through
+`pEnabledFeatures`; the maintenance6 probe enables it through `Features2`.
+Both device creation paths passed their 384 readbacks with synchronization
+validation enabled and zero errors. These are isolated library deployments,
+not APK/game acceptance. Earlier results below record revisions that kept the
+core flag disabled. Fill mode and CullDistance are separate outstanding
+requirements for the stock DXVK game path.
+
+Build the host capability regression from the repository root:
+
+```sh
+cc -O0 -Wall -Wextra -ffunction-sections -fdata-sections \
+  tests/baseline/bc-feature-policy.c hybris/vulkan/compat/bc_image.c \
+  -Wl,--gc-sections -lpthread -o /tmp/bc-feature-policy
+/tmp/bc-feature-policy
+```
+
+### Three-dimensional images (2026-10-11)
+
+`bc-images-volume-validation` uploads and samples three depth slices at each
+tested mip, using `sampler3D` against an independently uploaded native 3D golden
+reference. It covers all sixteen formats, two shapes, four mip levels, three
+submissions, a GPU-generated patch at nonzero z, BC-to-BC copies and copies
+through native 2D-array/3D images. On x300 all 384 readbacks matched and
+synchronization validation reported zero errors. The same layer then passed
+the 384-readback 2D maintenance6 regression with zero validation errors.
+
+Tested isolated layer SHA-256:
+`ce164d97a9e0745e2fa3158307ae2a62e1f7c008713e2813b1a43809bda5c11f`.
+No diagnostic feature-advertisement switch was enabled. This is not a production
+APK test. 3D blits, large volumes and other devices still need coverage. The layout-only
+`bc-volume-layout.c` also verifies shrinking mip depth and unchanged 2D-array
+offsets. Full `textureCompressionBC` remains unadvertised.
+
+The normal `arlinux-rootfs/tools/build/linux-gpu.sh` build then regenerated the
+library from the tracked source and working-tree diff, replacing the old build
+directory. Its compatibility layer SHA-256 is
+`4c28ae88f224dc046899089777e8f5b7d0f019db28a060848874931413cde4a0`.
+With this library, both the volume and maintenance6 synchronization-validation
+probes passed again: 384 readbacks each, zero mismatches and zero validation
+errors. The library contains neither the temporary Hell Clock feature switch
+nor the removed image-bounds transformation. These runs validate the normal
+library build, but still use an isolated deployment rather than a rebuilt APK.
+
+The volume probe also samples between depth slices with 3/4 and 1/4 weights.
+The BC/native comparison remains bit exact. The CPU filtered oracle checks the
+weighted eight-texel neighborhood, including sRGB conversion, signed channels
+and half-float values; nearest samples and raw compressed blocks retain their
+separate golden checks. This extended probe passed all 384 readbacks with zero
+validation errors on the normal-build library above. Manually mixing two
+filtered array samples was rejected as the bit-exact oracle because its
+rounding can differ from a single native 3D texture sample.
+
+### Batch binding results
+
+`bc-bind-status.c` exercises the actual resource wrapper with a mock driver.
+It covers native/emulated images in both orders, core/KHR entry points,
+success, an injected first-binding failure, and optional per-binding results.
+All 16 cases pass. A failure must not prevent the later binding from running;
+the emulated image reports its compressed buffer's actual binding result.
+This supplies the per-binding result behavior required by maintenance6.
+
+Build from the repository root with recent Vulkan headers:
+
+```sh
+cc -O0 -Wall -Wextra -ffunction-sections -fdata-sections \
+  tests/baseline/bc-bind-status.c -Wl,--gc-sections -o /tmp/bc-bind-status
+/tmp/bc-bind-status
+```
+
+See the [batch binding requirements](https://docs.vulkan.org/refpages/latest/refpages/source/vkBindImageMemory2.html).
+
+### maintenance6 compute-state restoration (2026-10-11)
+
+`bc-images-maintenance6` binds application descriptors (including a dynamic
+offset) and push constants using the KHR maintenance6 entry points before BC
+uploads. Sampling after decoding does not rebind application state. It also
+destroys the application pipeline layout before submission, exercising the
+retained layout clone. x300 passed 384 readbacks across sixteen BC formats,
+two shapes, four mip levels and three submissions, both without validation
+and with synchronization validation enabled (zero validation errors).
+
+The BC policy now preserves native maintenance6 support. Push descriptors,
+descriptor buffers and `VK_NV_per_stage_descriptor_set` remain filtered: the
+latter enables per-stage binding and null/inline pipeline layouts that the
+current journal cannot restore. This test does not establish complete Vulkan
+or BC format conformance; `textureCompressionBC` remains false.
+
+### Source blits (2026-10-11)
+
+Emulated BC formats now retain `BLIT_SRC` when their decoded native format
+supports it. The public image handle already names that decoded GPU image,
+so the driver's ordinary blit handles format conversion and filtering; no
+additional command wrapper or CPU readback is needed. `BLIT_DST` remains
+unavailable because a destination write would also need to update compressed
+backing storage. The complete `textureCompressionBC` feature remains false.
+
+Run `probe-glibc bc-images-blit` to build the sampled
+reference image using a BC-to-native blit instead of a CPU-golden upload.
+CPU-golden verification remains enabled. On x300 (V2509A / Mali-G1-Ultra),
+the new layer passed 384 readbacks over sixteen formats, two sizes, four mip
+levels and three submissions, including array layers and nearest/linear
+filters. The installed old layer reports unsupported at the first format.
+This run did not enable Vulkan validation layers. These are equal-extent
+blits. `bc-images-blit-scale` additionally magnifies twofold with nearest
+filtering and reverses both axes, then reduces/reverses back with alternating
+nearest/linear filters. Its 384 readbacks also passed on x300. Arbitrary
+ratios, linear-filtered BC enlargement and broader image types remain untested.
+The original upload/sampling test and the blit test through `dlsym` also
+passed 384 readbacks each (1,152 total across the three runs).
+The standard runner includes `icd-bc-images-blit`,
+`icd-bc-images-blit-scale`, and `icd-bc-images-blit-dlsym` cases.
 
 `bc-images` uses the existing baseline executable and runner. The application
 creates two BC images plus a size-compatible native UINT image, uploads data,

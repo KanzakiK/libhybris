@@ -12,18 +12,18 @@ Native format support takes precedence; forced emulation remains opt-in.
 | HYBRIS_VULKAN_COMPAT_UNUSED_BUILTINS | 1 | 0 |
 | HYBRIS_VULKAN_COMPAT_POINT_SIZE | 1 | 0 |
 | HYBRIS_VULKAN_COMPAT_INOUT | 1 | 0 |
-| HYBRIS_VULKAN_COMPAT_IMAGE_BOUNDS | 1 | 0 |
 | HYBRIS_VULKAN_COMPAT_VERTEX_STORES | 1, restricted to the inspected driver | 0 |
 | HYBRIS_MALI_MMUD_SKIP_LOADER_CHECK | 1, restricted to the matching driver build | 0 |
 
-The first seven switches remain disabled during secure execution. Existing
+The first six switches remain disabled during secure execution. Existing
 secure-execution behavior for vertex stores and the Mali loader quirk is
 unchanged. Capability checks, shader eligibility checks and driver guards
 remain in place. Debug logging, dumps, validation and the `force` values
 are not enabled by this policy.
 
-Default enablement is not a conformance claim. In particular, image-bounds
-rewriting changes selected out-of-range zero results to an in-bounds value.
+Default enablement is not a conformance claim. The former image-bounds rewrite
+was removed: proximity to an image instruction does not prove that a conditional
+select checks image bounds. It corrupted Hell Clock's material calculations.
 Unused-builtins cleanup is module-local and can affect cross-stage interface
 matching. BC fallback and packed/instanced vertex conversion still have
 limitations recorded in the baseline evidence; the expanded nonzero

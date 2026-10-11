@@ -73,12 +73,13 @@ static int parse_ids(const uint32_t *code, size_t words, struct parse_id *ids, u
         if (!count || count > words - at) return 0;
         if (op == 54) function = 1;
         if (op == 56) function = 0;
-        if ((op == 20 || op == 21 || op == 22 || op == 28 || op == 30 || op == 32) && count >= 2 && p[1] && p[1] < bound) {
+        if ((op == 20 || op == 21 || op == 22 || op == 23 || op == 24 || op == 28 || op == 30 || op == 32) && count >= 2 && p[1] && p[1] < bound) {
             ids[p[1]].op = op;
             ids[p[1]].at = (uint32_t)at;
             if (op == 21 && count == 4) ids[p[1]].value = p[3];
             if (op == 22 && count == 3) ids[p[1]].value = p[2];
             if (op == 28 && count == 4) { ids[p[1]].type = p[2]; ids[p[1]].object = p[3]; }
+            if ((op == 23 || op == 24) && count == 4) { ids[p[1]].type = p[2]; ids[p[1]].object = p[3]; }
             if (op == 32 && count == 4) { ids[p[1]].value = p[2]; ids[p[1]].object = p[3]; }
         } else if (op == 43 && count == 4 && p[2] && p[2] < bound) {
             ids[p[2]].op = op;
@@ -110,18 +111,75 @@ static uint32_t array_length(const struct parse_id *ids, uint32_t bound, uint32_
     return (len >= 1 && len <= 8) ? len : 0;
 }
 
-static void mark_locations(const uint32_t *code, size_t words, unsigned used[64])
+static unsigned location_span(const uint32_t *code, const struct parse_id *ids,
+    uint32_t bound, uint32_t type, unsigned depth)
 {
-    for (size_t at = 5; at < words;) {
-        uint32_t count = code[at] >> 16, op = code[at] & 65535;
-        if (!count || count > words - at) return;
-        if (op == 71 && count == 4 && code[at + 2] == 30 && code[at + 3] < 64)
-            used[code[at + 3]] = 1;
-        at += count;
+    if (!type || type >= bound || depth > 64) return 0;
+    const struct parse_id *id = &ids[type];
+    if (id->op == 21) return (code[id->at + 2] + 127) / 128;
+    if (id->op == 22) return (id->value + 127) / 128;
+    if (id->op == 23) {
+        if (id->type >= bound || !id->object || id->object > 4) return 0;
+        const struct parse_id *scalar = &ids[id->type];
+        unsigned width = scalar->op == 21 ? code[scalar->at + 2] : scalar->op == 22 ? scalar->value : 0;
+        return width ? ((width > 32 ? 2u : 1u) * id->object + 3) / 4 : 0;
     }
+    if (id->op == 24 || id->op == 28) {
+        unsigned span = location_span(code, ids, bound, id->type, depth + 1);
+        uint32_t count = id->op == 24 ? id->object : constant_value(ids, bound, id->object);
+        return span && count && count <= 64 / span ? span * count : 0;
+    }
+    if (id->op == 32 && (id->value == 1 || id->value == 3))
+        return location_span(code, ids, bound, id->object, depth + 1);
+    if (id->op == 30) {
+        unsigned span = 0;
+        uint32_t count = code[id->at] >> 16;
+        for (uint32_t i = 2; i < count; ++i) {
+            unsigned member = location_span(code, ids, bound, code[id->at + i], depth + 1);
+            if (!member || member > 64 - span) return 0;
+            span += member;
+        }
+        return span;
+    }
+    if (id->op == 59) return location_span(code, ids, bound, id->type, depth + 1);
+    return 0;
 }
 
-static int find_clip(const uint32_t *code, size_t words, const struct parse_id *ids, uint32_t bound,
+static int mark_locations(const uint32_t *code, size_t size, unsigned used[64])
+{
+    if (!code || size < 20 || size % 4 || code[0] != 0x07230203 || !code[3]) return 0;
+    uint32_t bound = code[3];
+    size_t words = size / 4;
+    if (sizeof(struct parse_id) > SIZE_MAX / bound) return 0;
+    struct parse_id *ids = hybris_scaled_alloc(NULL, bound * sizeof(*ids), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+    if (!ids) return 0;
+    int valid = parse_ids(code, words, ids, bound);
+    if (!valid) goto done;
+    for (size_t at = 5; at < words;) {
+        const uint32_t *p = code + at;
+        uint32_t count = p[0] >> 16, op = p[0] & 65535;
+        uint32_t type = 0, location = 0;
+        if (op == 71 && count == 4 && p[2] == 30 && p[1] < bound) {
+            type = p[1]; location = p[3];
+        }
+        if (op == 72 && count == 5 && p[3] == 30 && p[1] < bound && ids[p[1]].op == 30) {
+            unsigned members = (code[ids[p[1]].at] >> 16) - 2;
+            if (p[2] >= members) { valid = 0; break; }
+            type = code[ids[p[1]].at + 2 + p[2]]; location = p[4];
+        }
+        if (type) {
+            unsigned span = location_span(code, ids, bound, type, 0);
+            if (!span || location >= 64 || span > 64 - location) { valid = 0; break; }
+            for (unsigned i = 0; i < span; ++i) used[location + i] = 1;
+        }
+        at += count;
+    }
+done:
+    hybris_scaled_free(NULL, ids);
+    return valid;
+}
+
+static int find_distance(const uint32_t *code, size_t words, const struct parse_id *ids, uint32_t bound, uint32_t builtin,
     uint32_t *var, uint32_t *member, uint32_t *count, uint32_t *array)
 {
     uint32_t found_var = 0, found_member = 0xffffffffu, found_array = 0, found_count = 0;
@@ -129,7 +187,7 @@ static int find_clip(const uint32_t *code, size_t words, const struct parse_id *
         const uint32_t *p = code + at;
         uint32_t n = p[0] >> 16, op = p[0] & 65535;
         if (!n || n > words - at) return 0;
-        if (op == 71 && n == 4 && p[1] < bound && p[2] == 11 && p[3] == 3) {
+        if (op == 71 && n == 4 && p[1] < bound && p[2] == 11 && p[3] == builtin) {
             if (ids[p[1]].op != 59 || ids[p[1]].value != 3) return 0;
             if (ids[p[1]].type >= bound || ids[ids[p[1]].type].op != 32) return 0;
             found_var = p[1];
@@ -137,7 +195,7 @@ static int find_clip(const uint32_t *code, size_t words, const struct parse_id *
             found_count = array_length(ids, bound, found_array);
             found_member = 0xffffffffu;
         }
-        if (op == 72 && n == 5 && p[1] < bound && p[3] == 11 && p[4] == 3) {
+        if (op == 72 && n == 5 && p[1] < bound && p[3] == 11 && p[4] == builtin) {
             uint32_t struct_id = p[1], index = p[2], type_at, members;
             if (ids[struct_id].op != 30) return 0;
             type_at = ids[struct_id].at;
@@ -182,7 +240,7 @@ static uint32_t find_id_by_op(const struct parse_id *ids, uint32_t bound, uint32
     return 0;
 }
 
-VkResult hybris_spirv_clip_plan(const uint32_t *vs, size_t vs_size, const uint32_t *fs, size_t fs_size,
+static VkResult distance_plan(const uint32_t *vs, size_t vs_size, const uint32_t *fs, size_t fs_size, uint32_t builtin,
     uint32_t *location, uint32_t *count)
 {
     struct parse_id *ids = NULL;
@@ -205,18 +263,33 @@ VkResult hybris_spirv_clip_plan(const uint32_t *vs, size_t vs_size, const uint32
     ids = hybris_scaled_alloc(NULL, bound * sizeof(*ids), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
     if (!ids) { result = VK_ERROR_OUT_OF_HOST_MEMORY; goto done; }
     if (!parse_ids(vs, vs_size / 4, ids, bound) ||
-        !find_clip(vs, vs_size / 4, ids, bound, &var, &member, count, &array)) {
+        !find_distance(vs, vs_size / 4, ids, bound, builtin, &var, &member, count, &array)) {
         goto done;
     }
     memset(used, 0, sizeof(used));
-    mark_locations(vs, vs_size / 4, used);
-    if (fs && fs_size >= 20) mark_locations(fs, fs_size / 4, used);
+    if (!mark_locations(vs, vs_size, used) || (fs && !mark_locations(fs, fs_size, used))) {
+        result = VK_ERROR_FEATURE_NOT_PRESENT;
+        *count = 0;
+        goto done;
+    }
     *location = pick_location(used, *count);
-    if (*location == 0xffffffffu) *count = 0;
+    if (*location == 0xffffffffu) { *count = 0; result = VK_ERROR_FEATURE_NOT_PRESENT; }
 done:
     hybris_scaled_free(NULL, ids);
     hybris_scaled_free(NULL, cleaned);
     return result;
+}
+
+VkResult hybris_spirv_clip_plan(const uint32_t *vs, size_t vs_size, const uint32_t *fs, size_t fs_size,
+    uint32_t *location, uint32_t *count)
+{
+    return distance_plan(vs, vs_size, fs, fs_size, 3, location, count);
+}
+
+VkResult hybris_spirv_cull_plan(const uint32_t *vs, size_t vs_size, const uint32_t *fs, size_t fs_size,
+    uint32_t *location, uint32_t *count)
+{
+    return distance_plan(vs, vs_size, fs, fs_size, 4, location, count);
 }
 
 static int whole_struct_use(const uint32_t *code, size_t words, uint32_t var)
@@ -232,7 +305,7 @@ static int whole_struct_use(const uint32_t *code, size_t words, uint32_t var)
     return 0;
 }
 
-VkResult hybris_spirv_clip_vertex(const uint32_t *code, size_t size, uint32_t location,
+static VkResult distance_vertex(const uint32_t *code, size_t size, uint32_t location, uint32_t builtin,
     const VkAllocationCallbacks *allocator, uint32_t **output, size_t *output_size, unsigned *rewritten)
 {
     struct parse_id *ids = NULL;
@@ -253,9 +326,29 @@ VkResult hybris_spirv_clip_vertex(const uint32_t *code, size_t size, uint32_t lo
     ids = hybris_scaled_alloc(allocator, bound * sizeof(*ids), VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
     if (!ids) return VK_ERROR_OUT_OF_HOST_MEMORY;
     if (!parse_ids(code, words_n, ids, bound) ||
-        !find_clip(code, words_n, ids, bound, &var, &member, &count, &array))
+        !find_distance(code, words_n, ids, bound, builtin, &var, &member, &count, &array))
         goto done;
     if (whole_struct_use(code, words_n, var) && member != 0xffffffffu) goto done;
+    if (member == 0xffffffffu) {
+        // A separate distance variable can retain its ID and all load/store
+        // uses. Only its interface decoration changes; no shadow variable.
+        if (!grow(&out, words_n, allocator)) { status = VK_ERROR_OUT_OF_HOST_MEMORY; goto done; }
+        memcpy(out.w, code, 20);
+        out.n = 5;
+        for (at = 5; at < words_n; at += code[at] >> 16) {
+            const uint32_t *p = code + at;
+            uint32_t n = p[0] >> 16, op = p[0] & 65535;
+            if (op == 17 && n == 2 && p[1] == builtin + 29) continue;
+            if (!emit(&out, p, n, allocator)) { status = VK_ERROR_OUT_OF_HOST_MEMORY; goto done; }
+            if (op == 71 && n == 4 && p[1] == var && p[2] == 11 && p[3] == builtin) {
+                out.w[out.n - 2] = 30;
+                out.w[out.n - 1] = location;
+            }
+        }
+        *output = out.w; *output_size = out.n * 4; *rewritten = 1;
+        out.w = NULL;
+        goto done;
+    }
     ptr = alloc_id(&bound);
     new_var = alloc_id(&bound);
     if (!grow(&out, words_n + 32, allocator)) { status = VK_ERROR_OUT_OF_HOST_MEMORY; goto done; }
@@ -270,8 +363,10 @@ VkResult hybris_spirv_clip_vertex(const uint32_t *code, size_t size, uint32_t lo
         uint32_t n = p[0] >> 16, op = p[0] & 65535;
         uint32_t copy[32];
         if (!n || n > words_n - at) { status = VK_ERROR_UNKNOWN; goto done; }
-        if (op == 17 && n == 2 && (p[1] == 32 || p[1] == 7)) { at += n; continue; }
-        if (op == 71 && n == 4 && p[2] == 11 && (p[3] == 3 || p[3] == 4)) { at += n; continue; }
+        if (op == 17 && n == 2 && (p[1] == builtin + 29 || (builtin == 3 && p[1] == 7))) { at += n; continue; }
+        /* Translate only the selected distance kind. The other kind retains
+         * its own BuiltIn decoration and semantics. */
+        if (op == 71 && n == 4 && p[2] == 11 && p[3] == builtin) { at += n; continue; }
         if (!deco_done && op != 17 && op != 11 && op != 14 && op != 15 && op != 16 &&
             op != 71 && op != 72 && op != 6 && op != 5 && op != 7 && op != 8 && op != 10 &&
             op != 3 && op != 4) {
@@ -346,6 +441,18 @@ done:
         *rewritten = 0;
     }
     return status;
+}
+
+VkResult hybris_spirv_clip_vertex(const uint32_t *code, size_t size, uint32_t location,
+    const VkAllocationCallbacks *allocator, uint32_t **output, size_t *output_size, unsigned *rewritten)
+{
+    return distance_vertex(code, size, location, 3, allocator, output, output_size, rewritten);
+}
+
+VkResult hybris_spirv_cull_vertex(const uint32_t *code, size_t size, uint32_t location,
+    const VkAllocationCallbacks *allocator, uint32_t **output, size_t *output_size, unsigned *rewritten)
+{
+    return distance_vertex(code, size, location, 4, allocator, output, output_size, rewritten);
 }
 
 static uint32_t ensure_type(struct emit *prelude, struct parse_id *ids, uint32_t *bound,

@@ -45,7 +45,7 @@ int vkprobe(const char *route);
 int memory_ranges_probe(int validate);
 int memory_readback_probe(int validate);
 int bc_decode_probe(int validate);
-int bc_images_probe(int validate, int route);
+int bc_images_probe(int validate, int route, int blit_mode);
 int vertex_store_probe(int raw, int validate);
 int point_size_probe(int validate, int route);
 int dispatch_probe(void);
