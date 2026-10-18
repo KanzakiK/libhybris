@@ -70,22 +70,6 @@ static const struct wl_callback_listener frame_listener = {
     wayland_frame_callback
 };
 
-static void wake_presenter(void *, wl_callback *callback, uint32_t)
-{
-    wl_callback_destroy(callback);
-}
-static const wl_callback_listener wake_listener = {wake_presenter};
-
-void WaylandNativeWindow::stopPresentation()
-{
-    presentation_stopped.store(true);
-    // Do not take the pool mutex: the worker can hold it while dispatching.
-    // A sync reply (unlike a frame callback) also arrives for hidden surfaces.
-    wl_callback *wake = wl_display_sync(wl_dpy_wrapper);
-    if (wake) wl_callback_add_listener(wake, &wake_listener, nullptr);
-    wl_display_flush(m_display);
-}
-
 void WaylandNativeWindow::destroyWlEGLWindow()
 {
     wl_egl_window_destroy(m_window);
@@ -114,7 +98,6 @@ int WaylandNativeWindow::apiDisconnect(int api)
         wl_callback_destroy(frame_callback);
         frame_callback = NULL;
     }
-    presentation_stopped.store(false);
     HYBRIS_TRACE_COUNTER("wayland-platform", "retired_buffers", "%u", retained);
     HYBRIS_TRACE_END("wayland-platform", "producer_disconnect", "");
     unlock();
@@ -206,14 +189,7 @@ int WaylandNativeWindow::dequeueBufferTimeout(BaseNativeWindowBuffer **buffer, i
     HYBRIS_TRACE_BEGIN("wayland-platform", "dequeueBufferTimeout", "");
     *buffer = nullptr;
     *fenceFd = -1;
-    if (timeout_ns == 0) {
-        // A presenter may be dispatching its frame callback. A zero-timeout
-        // acquire must not wait for that thread's pool lock either.
-        int error = pthread_mutex_trylock(&mutex);
-        if (error) return error == EBUSY ? -EAGAIN : -error;
-    } else {
-        lock();
-    }
+    lock();
     struct timespec started;
     clock_gettime(CLOCK_MONOTONIC, &started);
     int error = 0;
@@ -326,15 +302,16 @@ int WaylandNativeWindow::dequeueBufferTimeout(BaseNativeWindowBuffer **buffer, i
 int WaylandNativeWindow::presentBuffer(WaylandNativeWindowBuffer *wnb)
 {
     int ret = 0;
-    if (presentationStopped()) return -ECANCELED;
     if (!m_window) {
         return -EPIPE;
     }
 
     ret = wl_display_dispatch_queue_pending(m_display, wl_queue);
-    while (this->frame_callback && ret != -1 && !presentationStopped())
-        ret = wl_display_dispatch_queue(m_display, wl_queue);
-    if (presentationStopped()) return -ECANCELED;
+    if (this->frame_callback) {
+        do {
+            ret = wl_display_dispatch_queue(m_display, wl_queue);
+        } while (this->frame_callback && ret != -1);
+    }
     if (ret < 0) {
         HYBRIS_TRACE_END("wayland-platform", "queueBuffer_wait_for_frame_callback", "");
         return -EPIPE;

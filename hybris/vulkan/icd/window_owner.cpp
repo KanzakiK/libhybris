@@ -17,7 +17,6 @@
 #include <android-config.h>
 #include "window_owner.h"
 #include "wayland_window.h"
-#include "ordered_presenter.h"
 #include <algorithm>
 #include <errno.h>
 #include <new>
@@ -25,44 +24,13 @@
 #include <unistd.h>
 #include <poll.h>
 
-struct present_job { ANativeWindowBuffer *buffer; int fence; };
 struct hybris_vk_wayland_window {
     wl_event_queue *queue;
     wl_registry *registry;
     android_wlegl *wlegl;
     WaylandNativeWindow *native;
     wl_display *wrapper;
-    OrderedPresenter<present_job, 8> *presenter;
 };
-
-static int consume_fence(int fd)
-{
-    if (fd < 0) return 0;
-    pollfd wait = {fd, POLLIN, 0};
-    int status;
-    do { status = poll(&wait, 1, -1); } while (status < 0 && errno == EINTR);
-    int error = status < 0 || !(wait.revents & POLLIN) ? -EIO : 0;
-    close(fd);
-    return error;
-}
-
-static int present(void *data, present_job job, bool discard)
-{
-    auto *owner = static_cast<hybris_vk_wayland_window *>(data);
-    // android_wlegl has no acquire-fence protocol. Wait before commit, but
-    // outside BOTH the game's submitting thread and the native pool mutex.
-    int error = consume_fence(job.fence);
-    ANativeWindow *window = owner->native;
-    if (!error) {
-        bool cancel = discard || owner->native->presentationStopped();
-        error = cancel ? window->cancelBuffer(window, job.buffer, -1)
-                       : window->queueBuffer(window, job.buffer, -1);
-        if (error == -ECANCELED && owner->native->presentationStopped())
-            error = window->cancelBuffer(window, job.buffer, -1);
-    }
-    job.buffer->common.decRef(&job.buffer->common);
-    return error;
-}
 
 static void registry_global(void *data, wl_registry *registry, uint32_t name,
     const char *interface, uint32_t version)
@@ -79,8 +47,6 @@ static const wl_registry_listener listener = {registry_global, registry_remove};
 void hybris_vk_wayland_window_destroy(hybris_vk_wayland_window *owner)
 {
     if (!owner) return;
-    if (owner->native) owner->native->stopPresentation();
-    delete owner->presenter; // drain/join before destroying any native objects
     if (owner->native) {
         owner->native->destroyWlEGLWindow();
         owner->native->common.decRef(&owner->native->common);
@@ -125,10 +91,6 @@ int hybris_vk_wayland_window_create(wl_display *display, wl_surface *surface,
         goto fail;
     }
     owner->native->common.incRef(&owner->native->common);
-    owner->presenter = new (std::nothrow) OrderedPresenter<present_job, 8>;
-    if (!owner->presenter) goto fail;
-    error = owner->presenter->start(owner, present);
-    if (error) goto fail;
     *out = owner;
     return 0;
 fail:
@@ -151,29 +113,8 @@ int hybris_vk_wayland_window_dequeue(hybris_vk_wayland_window *owner,
     int64_t timeout_ns, ANativeWindowBuffer **buffer, int *fence_fd)
 {
     if (!owner || !owner->native || !buffer || !fence_fd) return -EINVAL;
-    *buffer = nullptr;
-    *fence_fd = -1;
     BaseNativeWindowBuffer *result = nullptr;
-    timespec started;
-    clock_gettime(CLOCK_MONOTONIC, &started);
-    int error;
-    for (;;) {
-        error = owner->presenter->status();
-        if (error) return error;
-        // A blocking dequeue holds the pool mutex while polling Wayland and
-        // would prevent our worker from committing the buffer that frees it.
-        error = owner->native->dequeueBufferTimeout(&result, fence_fd, 0);
-        if (error != -EAGAIN) break;
-        if (!timeout_ns) return -EAGAIN;
-        if (timeout_ns > 0) {
-            timespec now;
-            clock_gettime(CLOCK_MONOTONIC, &now);
-            int64_t elapsed = (int64_t)(now.tv_sec - started.tv_sec) * 1000000000LL
-                + now.tv_nsec - started.tv_nsec;
-            if (elapsed >= timeout_ns) return -ETIMEDOUT;
-        }
-        owner->presenter->waitProgress();
-    }
+    int error = owner->native->dequeueBufferTimeout(&result, fence_fd, timeout_ns);
     // BaseNativeWindowBuffer has a vtable before its ANativeWindowBuffer base.
     // A pointer-to-pointer reinterpret_cast bypasses this base adjustment.
     *buffer = result;
@@ -187,15 +128,8 @@ int hybris_vk_wayland_window_queue(hybris_vk_wayland_window *owner,
         if (fence_fd >= 0) close(fence_fd);
         return -EINVAL;
     }
-    buffer->common.incRef(&buffer->common);
-    int error = owner->presenter->submit({buffer, fence_fd});
-    if (error) {
-        // The caller will cancel this rejected image. Finish its GPU writes
-        // before returning, never close a live fence and recycle the buffer.
-        consume_fence(fence_fd);
-        buffer->common.decRef(&buffer->common);
-    }
-    return error;
+    ANativeWindow *window = owner->native;
+    return window->queueBuffer(window, buffer, fence_fd);
 }
 
 int hybris_vk_wayland_window_cancel(hybris_vk_wayland_window *owner,
@@ -220,7 +154,5 @@ int hybris_vk_wayland_window_cancel(hybris_vk_wayland_window *owner,
 void hybris_vk_wayland_window_disconnect(hybris_vk_wayland_window *owner)
 {
     if (!owner || !owner->native) return;
-    owner->native->stopPresentation();
-    owner->presenter->drain();
     owner->native->apiDisconnect(0);
 }

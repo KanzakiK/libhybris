@@ -86,7 +86,7 @@ libhybris_vulkan_icd_la_LDFLAGS += -lxcb -lX11-xcb -lX11
 endif
 libhybris_vulkan_icd_la_SOURCES += \
     icd/native_window.h icd/native_window_wayland.c \
-    icd/window_owner.cpp icd/window_owner.h icd/ordered_presenter.h \
+    icd/window_owner.cpp icd/window_owner.h \
     icd/wayland_window.cpp icd/wayland_window.h \
     $(top_srcdir)/platforms/wayland/wayland_window_common.cpp
 libhybris_vulkan_icd_la_CFLAGS += \
