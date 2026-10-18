@@ -5,6 +5,17 @@
 #include <stdio.h>
 static uintptr_t next_handle=1;
 static VkResult native_result=VK_SUCCESS;
+static unsigned resolves, recorded, second_recorded;
+static void VKAPI_CALL record_pipeline(VkCommandBuffer c,VkPipelineBindPoint p,VkPipeline v)
+{(void)c;(void)p;(void)v;++recorded;}
+static void VKAPI_CALL record_pipeline_second(VkCommandBuffer c,VkPipelineBindPoint p,VkPipeline v)
+{(void)c;(void)p;(void)v;++second_recorded;}
+static void VKAPI_CALL record_descriptors(VkCommandBuffer c,VkPipelineBindPoint p,VkPipelineLayout l,
+ uint32_t f,uint32_t n,const VkDescriptorSet *s,uint32_t o,const uint32_t *v)
+{(void)c;(void)p;(void)l;(void)f;(void)n;(void)s;(void)o;(void)v;++recorded;}
+static void VKAPI_CALL record_push(VkCommandBuffer c,VkPipelineLayout l,VkShaderStageFlags s,
+ uint32_t o,uint32_t n,const void *v)
+{(void)c;(void)l;(void)s;(void)o;(void)n;(void)v;++recorded;}
 int hybris_shader_polygon_active(VkDevice d) {(void)d;return 0;}
 void hybris_bc_transfer_init(struct hybris_bc_transfer *t,const struct hybris_bc_decoder *d,
  const VkPhysicalDeviceMemoryProperties *m,const VkPhysicalDeviceLimits *l)
@@ -25,7 +36,10 @@ static void VKAPI_CALL release(VkDevice d,VkCommandPool p,uint32_t n,const VkCom
 static void VKAPI_CALL destroy(VkDevice d,VkCommandPool p,const VkAllocationCallbacks *a)
 {(void)d;(void)p;(void)a;}
 static PFN_vkVoidFunction VKAPI_CALL resolve(VkDevice d,const char *n)
-{(void)d;
+{++resolves;
+ if(!strcmp(n,"vkCmdBindPipeline"))return (PFN_vkVoidFunction)(d==(VkDevice)2 ? record_pipeline_second : record_pipeline);
+ if(!strcmp(n,"vkCmdBindDescriptorSets"))return (PFN_vkVoidFunction)record_descriptors;
+ if(!strcmp(n,"vkCmdPushConstants"))return (PFN_vkVoidFunction)record_push;
  if(!strcmp(n,"vkAllocateCommandBuffers"))return (PFN_vkVoidFunction)alloc;
  if(!strcmp(n,"vkResetCommandPool"))return (PFN_vkVoidFunction)reset;
  if(!strcmp(n,"vkFreeCommandBuffers"))return (PFN_vkVoidFunction)release;
@@ -36,6 +50,7 @@ int main(void)
 {
  struct hybris_bc_device *d=calloc(1,sizeof(*d));assert(d);
  d->handle=(VkDevice)1;d->resolver=resolve;pthread_mutex_init(&d->guard,NULL);
+ init_recording_dispatch(d);
  hybris_bc_layouts_init(&d->layouts,d->handle,resolve);devices=d;
  VkCommandBuffer handles[2048],other;
  VkCommandBufferAllocateInfo info={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
@@ -43,6 +58,20 @@ int main(void)
  assert(!allocate_commands(d->handle,&info,handles));
  info.commandPool=(VkCommandPool)2;info.commandBufferCount=1;
  assert(!allocate_commands(d->handle,&info,&other));
+ unsigned before=resolves;
+ for(unsigned i=0;i<10000;++i) {
+  bind_pipeline(other,VK_PIPELINE_BIND_POINT_GRAPHICS,(VkPipeline)1);
+  bind_descriptors(other,VK_PIPELINE_BIND_POINT_GRAPHICS,(VkPipelineLayout)1,0,0,NULL,0,NULL);
+  push_constants(other,(VkPipelineLayout)1,VK_SHADER_STAGE_VERTEX_BIT,0,0,NULL);
+ }
+ assert(resolves==before && recorded==30000);
+ struct hybris_bc_device second={.handle=(VkDevice)2,.resolver=resolve};
+ init_recording_dispatch(&second);
+ assert(second.bind_pipeline!=d->bind_pipeline);
+ second.bind_pipeline(other,VK_PIPELINE_BIND_POINT_GRAPHICS,(VkPipeline)1);
+ d->bind_pipeline(other,VK_PIPELINE_BIND_POINT_GRAPHICS,(VkPipeline)1);
+ assert(second_recorded==1 && recorded==30001);
+ puts("PASS immutable BC recording dispatch: no hot-path resolves and device isolation");
  struct hybris_bc_device *owner;
  native_result=VK_ERROR_OUT_OF_HOST_MEMORY;
  assert(reset_pool(d->handle,(VkCommandPool)1,0)==native_result);

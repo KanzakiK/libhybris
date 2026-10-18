@@ -182,8 +182,7 @@ static void VKAPI_CALL bind_pipeline(VkCommandBuffer handle, VkPipelineBindPoint
     struct hybris_bc_device *device;
     struct hybris_bc_command *command = hybris_bc_command_find(handle, &device);
     if (!command) return;
-    PROC(CmdBindPipeline);
-    CmdBindPipeline(handle, point, pipeline);
+    device->bind_pipeline(handle, point, pipeline);
     if (journal_enabled(device)) hybris_bc_save_pipeline(&command->state, point, pipeline);
 }
 static void VKAPI_CALL bind_descriptors(VkCommandBuffer handle, VkPipelineBindPoint point,
@@ -193,8 +192,7 @@ static void VKAPI_CALL bind_descriptors(VkCommandBuffer handle, VkPipelineBindPo
     struct hybris_bc_device *device;
     struct hybris_bc_command *command = hybris_bc_command_find(handle, &device);
     if (!command) return;
-    PROC(CmdBindDescriptorSets);
-    CmdBindDescriptorSets(handle, point, layout, first, count, sets, offset_count, offsets);
+    device->bind_descriptors(handle, point, layout, first, count, sets, offset_count, offsets);
     if (journal_enabled(device))
         hybris_bc_save_descriptors(&command->state, point, layout, first, count, sets, offset_count, offsets);
 }
@@ -204,8 +202,7 @@ static void VKAPI_CALL push_constants(VkCommandBuffer handle, VkPipelineLayout l
     struct hybris_bc_device *device;
     struct hybris_bc_command *command = hybris_bc_command_find(handle, &device);
     if (!command) return;
-    PROC(CmdPushConstants);
-    CmdPushConstants(handle, layout, stages, offset, size, values);
+    device->push_constants(handle, layout, stages, offset, size, values);
     if (journal_enabled(device)) hybris_bc_save_push(&command->state, layout, stages, offset, size, values);
 }
 /* maintenance6 entry points also change the compute state temporarily used

@@ -50,6 +50,12 @@ void hybris_bc_free(struct hybris_bc_device *device, void *memory)
     if (device->custom_allocator) device->allocator.pfnFree(device->allocator.pUserData, memory);
     else free(memory);
 }
+static void init_recording_dispatch(struct hybris_bc_device *device)
+{
+    device->bind_pipeline = (PFN_vkCmdBindPipeline)device->resolver(device->handle, "vkCmdBindPipeline");
+    device->bind_descriptors = (PFN_vkCmdBindDescriptorSets)device->resolver(device->handle, "vkCmdBindDescriptorSets");
+    device->push_constants = (PFN_vkCmdPushConstants)device->resolver(device->handle, "vkCmdPushConstants");
+}
 VkResult hybris_bc_device_add(VkDevice handle, PFN_vkGetDeviceProcAddr resolver,
     const VkPhysicalDeviceMemoryProperties *memory, const VkPhysicalDeviceProperties *properties,
     unsigned format_mask, unsigned rgb_mask, const VkAllocationCallbacks *allocator)
@@ -61,6 +67,7 @@ VkResult hybris_bc_device_add(VkDevice handle, PFN_vkGetDeviceProcAddr resolver,
     struct hybris_bc_device *device = hybris_bc_alloc(&initial, sizeof(*device));
     if (!device) return VK_ERROR_OUT_OF_HOST_MEMORY;
     *device = initial;
+    init_recording_dispatch(device);
     pthread_mutex_init(&device->guard, NULL);
     hybris_bc_layouts_init(&device->layouts, handle, resolver);
     VkResult result = VK_SUCCESS;
