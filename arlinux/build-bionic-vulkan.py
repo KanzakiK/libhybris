@@ -44,7 +44,7 @@ def main():
         subprocess.run(command, stdin=patch_input, check=True)
     generated = output / 'include'
     (generated / 'hybris/common').mkdir(parents=True, exist_ok=True)
-    (generated / 'config.h').write_text('#define WANT_WAYLAND 1\n#define WANT_X11 1\n')
+    (generated / 'config.h').write_text('#define WANT_WAYLAND 1\n')
     (generated / 'android-config.h').write_text('#define ANDROID_VERSION_MAJOR 10\n#define ANDROID_VERSION_MINOR 0\n#define ANDROID_VERSION_PATCH 0\n')
     (generated / 'logging.h').write_text('#define TRACE(...)\n#define HYBRIS_TRACE_BEGIN(...)\n#define HYBRIS_TRACE_END(...)\n#define HYBRIS_TRACE_COUNTER(...)\n')
     (generated / 'vulkanhybris.h').write_text('')
@@ -108,7 +108,7 @@ int bionic_hw_get_module(const char*, const hw_module_t**);
     protocol = output / 'wayland-android-protocol.c'
     subprocess.run(['wayland-scanner', 'private-code', str(xml), str(protocol)], check=True)
     files = [stage / 'vulkan/icd' / name for name in ['icd.c', 'instance.c', 'device.c', 'wsi.c', 'swapchain.c',
-             'native_window_wayland.c', 'native_window_x11.cpp', 'window_owner.cpp', 'wayland_window.cpp']]
+             'native_window_wayland.c', 'window_owner.cpp', 'wayland_window.cpp']]
     files += [stage / 'platforms/common/nativewindowbase.cpp', stage / 'platforms/wayland/wayland_window_common.cpp',
               component / 'bionic-vulkan/native.cpp', protocol]
     # Use the AOSP usage conversion already shipped with the shared adapter.
@@ -125,7 +125,7 @@ int bionic_hw_get_module(const char*, const hw_module_t**);
     library = output / 'libvulkan_android_desktop.so'
     subprocess.run([str(compiler) + '++', '-shared', '-static-libstdc++', *objects,
                     '-L' + str(args.native_prefix.resolve() / 'lib'), '-landroid', '-lnativewindow', '-ldl',
-                    '-lwayland-client', '-lwayland-egl', '-lxcb', '-lX11-xcb', '-lX11',
+                    '-lwayland-client', '-lwayland-egl',
                     '-Wl,--no-undefined,-z,nodelete,-z,max-page-size=16384',
                     '-Wl,-soname,libvulkan_android_desktop.so', '-o', str(library)], check=True)
     print(library)
