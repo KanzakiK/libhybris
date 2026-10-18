@@ -33,7 +33,7 @@ def main():
             shutil.copyfile(path, target)
     # Correct the HAL's float-control capability at the shared Vulkan layer.
     # Applications such as DXVK then use the ordinary capability query path.
-    patch = root / 'tools/patches/libhybris-adreno-float-properties.patch'
+    patch = component / 'libhybris-adreno-float-properties.patch'
     with patch.open('rb') as patch_input:
         check = subprocess.run(['patch', '-d', str(stage), '-p1', '--batch', '--fuzz=0', '--dry-run'],
                                stdin=patch_input, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -99,11 +99,11 @@ int bionic_hw_get_module(const char*, const hw_module_t**);
     ndk = args.ndk.resolve() / 'toolchains/llvm/prebuilt/linux-x86_64'
     compiler = ndk / 'bin/aarch64-linux-android29-clang'
     includes = [generated, args.graphics_prefix / 'include', args.native_prefix / 'include',
-                root / 'graphics-protocols/include', args.headers, source / 'include',
+                component / 'graphics-protocols/include', args.headers, source / 'include',
                 stage / 'platforms/common', stage / 'platforms/wayland', stage / 'vulkan/icd']
     flags = ['-fPIC', '-O2', '-fvisibility=hidden', '-D_GNU_SOURCE', '-DANDROID_BUILD', '-DHYBRIS_NO_SERVER_SIDE_BUFFERS']
     flags += ['-I' + str(path.resolve()) for path in includes]
-    xml = root / 'graphics-protocols/wayland-android.xml'
+    xml = component / 'graphics-protocols/wayland-android.xml'
     subprocess.run(['wayland-scanner', 'client-header', str(xml), str(generated / 'wayland-android-client-protocol.h')], check=True)
     protocol = output / 'wayland-android-protocol.c'
     subprocess.run(['wayland-scanner', 'private-code', str(xml), str(protocol)], check=True)
