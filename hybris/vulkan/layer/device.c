@@ -128,17 +128,22 @@ VkResult VKAPI_CALL hybris_layer_create_device(VkPhysicalDevice physical,
 #define HYBRIS_RESOLVE_RECORDING(n, type) state->recording.n = (PFN_vk##type)resolve_inner(&state->device, "vk" #n);
     HYBRIS_LAYER_RECORDING_PROCS(HYBRIS_RESOLVE_RECORDING)
 #undef HYBRIS_RESOLVE_RECORDING
-    /* Preserve the visibility hooks used by the recording wrapper. */
+    /* Upload visibility is an application policy, not a requirement of vertex
+     * binding. Installing its no-op wrapper on other devices defeats the
+     * immutable dispatch above: each bind would resolve the same inner target
+     * again, traversing the loader and taking its registry locks. */
 #define HYBRIS_RESOLVE_RESOURCE(n, type) do { \
     PFN_vkVoidFunction hook = hybris_memory_visibility_proc("vk" #n); \
     if (state->recording.n && hook) state->recording.n = (PFN_vk##type)hook; \
 } while (0)
-    HYBRIS_RESOLVE_RESOURCE(CmdBindVertexBuffers, CmdBindVertexBuffers);
-    HYBRIS_RESOLVE_RESOURCE(CmdBindVertexBuffers2, CmdBindVertexBuffers2);
-    HYBRIS_RESOLVE_RESOURCE(CmdBindVertexBuffers2EXT, CmdBindVertexBuffers2EXT);
-    HYBRIS_RESOLVE_RESOURCE(CmdBindIndexBuffer, CmdBindIndexBuffer);
-    HYBRIS_RESOLVE_RESOURCE(CmdBindIndexBuffer2, CmdBindIndexBuffer2KHR);
-    HYBRIS_RESOLVE_RESOURCE(CmdBindIndexBuffer2KHR, CmdBindIndexBuffer2KHR);
+    if (state->device.application_policy & HYBRIS_APP_HOST_UPLOAD_FLUSH) {
+        HYBRIS_RESOLVE_RESOURCE(CmdBindVertexBuffers, CmdBindVertexBuffers);
+        HYBRIS_RESOLVE_RESOURCE(CmdBindVertexBuffers2, CmdBindVertexBuffers2);
+        HYBRIS_RESOLVE_RESOURCE(CmdBindVertexBuffers2EXT, CmdBindVertexBuffers2EXT);
+        HYBRIS_RESOLVE_RESOURCE(CmdBindIndexBuffer, CmdBindIndexBuffer);
+        HYBRIS_RESOLVE_RESOURCE(CmdBindIndexBuffer2, CmdBindIndexBuffer2KHR);
+        HYBRIS_RESOLVE_RESOURCE(CmdBindIndexBuffer2KHR, CmdBindIndexBuffer2KHR);
+    }
 #undef HYBRIS_RESOLVE_RESOURCE
     pthread_mutex_lock(&guard);
     state->next = devices;
