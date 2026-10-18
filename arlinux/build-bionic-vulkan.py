@@ -20,6 +20,13 @@ def main():
     component = Path(__file__).resolve().parent
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
+    # Linux-only console regression runs inside the existing component job,
+    # before producing the Android adapter. It installs no test APK.
+    presenter_check = output / 'ordered-presenter-check'
+    subprocess.run(['c++', '-std=c++17', '-O2', '-Wall', '-Wextra', '-Werror', '-pthread',
+                    str(args.source.resolve() / 'tests/wsi/ordered_presenter_check.cpp'),
+                    '-o', str(presenter_check)], check=True)
+    subprocess.run([str(presenter_check)], check=True, timeout=15)
     source = args.source.resolve() / 'hybris'
     stage = output / 'source'
     # Refresh only the selected files; do not alter the shared source checkout.

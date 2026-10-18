@@ -189,7 +189,14 @@ int WaylandNativeWindow::dequeueBufferTimeout(BaseNativeWindowBuffer **buffer, i
     HYBRIS_TRACE_BEGIN("wayland-platform", "dequeueBufferTimeout", "");
     *buffer = nullptr;
     *fenceFd = -1;
-    lock();
+    if (timeout_ns == 0) {
+        // A presenter may be dispatching its frame callback. A zero-timeout
+        // acquire must not wait for that thread's pool lock either.
+        int error = pthread_mutex_trylock(&mutex);
+        if (error) return error == EBUSY ? -EAGAIN : -error;
+    } else {
+        lock();
+    }
     struct timespec started;
     clock_gettime(CLOCK_MONOTONIC, &started);
     int error = 0;
