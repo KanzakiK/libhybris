@@ -25,7 +25,8 @@ def main():
     # the native adapter. These are console tests, not Android test APKs.
     check = output / 'command-index-lifetime-check'
     subprocess.run(['cc', '-O2', '-Wall', '-Wextra', '-Werror', '-ffunction-sections',
-                    '-fdata-sections', '-I' + str(source / 'vulkan/compat'),
+                    '-fdata-sections', '-I' + str(args.graphics_prefix.resolve() / 'include'),
+                    '-I' + str(source / 'vulkan/compat'),
                     str(args.source.resolve() / 'tests/baseline/command_index_lifetime_check.c'),
                     str(source / 'vulkan/compat/bc_command_state.c'),
                     '-Wl,--gc-sections', '-pthread', '-o', str(check)], check=True)
