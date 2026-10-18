@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #define H(t,n) ((t)(uintptr_t)(n))
 static unsigned next_pool=1,next_command=1,destroyed;
 static VkResult native_result=VK_SUCCESS;
@@ -135,4 +136,34 @@ int main(void)
  DestroyCommandPool(device,a,NULL);assert(destroyed==6);
  hybris_layer_commands_release_device(device);assert(destroyed==7);
  puts("PASS command resources: retained across end/failure, begin/reset/free/device retirement, pool isolation, no double-free, callbacks outside locks");
+ /* Exercise indexed hot-path lookups and retirement with real wrapper
+  * allocations, including collision chains and driver-handle reuse. */
+ const unsigned sizes[]={16,152,2048};
+ for(unsigned run=0;run<3;++run) {
+  unsigned count=sizes[run];VkCommandBuffer many[2048];
+  assert(CreateCommandPool(device,&pool,NULL,&a)==VK_SUCCESS);
+  info.commandPool=a;info.commandBufferCount=count;
+  assert(AllocateCommandBuffers(device,&info,many)==VK_SUCCESS);
+  struct hybris_layer_device owner;
+  for(unsigned i=0;i<count;++i) assert(hybris_layer_command_device(many[i],&owner) && owner.handle==device);
+  struct timespec start,finish;clock_gettime(CLOCK_MONOTONIC,&start);
+  for(unsigned i=0;i<100000;++i) assert(hybris_layer_command_device(many[0],&owner));
+  clock_gettime(CLOCK_MONOTONIC,&finish);
+  double ns=(finish.tv_sec-start.tv_sec)*1e9+finish.tv_nsec-start.tv_nsec;
+  printf("layer command lookup live=%u ns/call=%.2f\n",count,ns/100000);
+  assert(ResetCommandPool(device,a,0)==VK_SUCCESS);
+  for(unsigned i=0;i<count;++i) assert(hybris_layer_command_device(many[i],&owner));
+  FreeCommandBuffers(device,a,count/2,many);
+  for(unsigned i=0;i<count;++i) assert(!!hybris_layer_command_device(many[i],&owner)==(i>=count/2));
+  DestroyCommandPool(device,a,NULL);
+  for(unsigned i=0;i<count;++i) assert(!hybris_layer_command_device(many[i],&owner));
+  next_command=(uintptr_t)many[0];
+  assert(CreateCommandPool(device,&pool,NULL,&b)==VK_SUCCESS);
+  info.commandPool=b;info.commandBufferCount=1;
+  assert(AllocateCommandBuffers(device,&info,commands)==VK_SUCCESS && commands[0]==many[0]);
+  assert(hybris_layer_command_device(commands[0],&owner));
+  hybris_layer_commands_release_device(device);
+  assert(!hybris_layer_command_device(commands[0],&owner));
+ }
+ puts("PASS indexed layer command scale/reset/free/pool/device retirement/handle reuse");
 }

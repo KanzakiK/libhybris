@@ -22,7 +22,10 @@ only the TAWC-DRI/android_wlegl client. It requires a local AF_UNIX connection,
 a supported TrueColor visual and TAWC-DRI 0.3. PresentBuffer sends gralloc
 handles through SCM_RIGHTS; BufferRelease controls buffer reuse. Xlib shares
 its XCB connection without changing application event ownership. There is no
-PRESENT_SOCKET fallback. GPU release fences currently require a host wait.
+PRESENT_SOCKET fallback. GPU release fences require a host wait; X11 queues
+transfer that wait to a per-window ordered presenter. BufferRelease still
+controls reuse, and disconnect/destroy quiesce pending submissions before
+retiring their buffer references. A later acquire reports asynchronous errors.
 Swapchain creation requires opaque composite alpha. `fence-acquire` acquires
 each frame with a fence, checks its signaled status and a repeated zero-timeout
 wait, resets it, and checks that the reset fence is unsignaled. Only then does
@@ -40,6 +43,33 @@ or caching fence completion outside the driver.
 
 Device results and artifact hashes are recorded in the
 [fence acquisition review](../wsi/fence-acquire-review.md).
+
+`async_present.cpp` exercises the production queue/worker/dequeue with fake
+XCB/gralloc: an unsignaled fence must not block queue return, submissions stay
+ordered, buffers are retained until release, exhausted-pool acquire makes
+progress, disconnect/resize wait for queued work, deferred X errors reach
+acquire, and destroy joins a presenter holding an unsignaled fence. The error
+case deliberately prints an X11 request rejection before PASS. This is a native
+console unit, not a GUI APK or GPU/rendering acceptance result.
+
+A checked X request must not retain the pool mutex across its server round
+trip. The unit blocks that check for 150 ms and requires another available
+buffer to be acquired within 50 ms. A release delivered before the check
+finishes must not recycle the submitted buffer until both operations complete.
+
+The private-release case routes release events without leaving the socket
+readable, as another XCB reader can do. Exhausted-pool acquisition must finish
+within 30 ms after a release scheduled at 5 ms. The previous 50-ms socket poll
+fails this check; 1-ms private-queue rechecks pass. This is a fallback for shared
+XCB event consumption, not a change to GPU fence or release ownership semantics.
+
+Build with `python3 tests/x11/build-async.py --ndk NDK --native-prefix PREFIX
+--generated ICD_BUILD/include --headers ANDROID_HEADERS --protocol-include
+GRAPHICS_PROTOCOLS/include --output BUILD_DIRECTORY`. Run the resulting
+`async-present-test` with a bounded timeout; it has no real XCB/gralloc runtime
+dependency. Add `--host --sanitize` for host ASan/UBSan, or stage the matching
+NDK ASan runtime when using `--sanitize` on Android. Then verify real
+presentation/readback/resize and game performance separately.
 
 The old server builder and vendored TAWC patch have been removed. Historical
 results in the [integration review](../wsi/integration-review.md) and

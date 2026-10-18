@@ -31,10 +31,12 @@ static int consume_fence(int fd) {
 }
 struct Buffer : BaseNativeWindowBuffer {
     bool held = false;
+    bool queued = false;
     Buffer() { handle = nullptr; }
     ~Buffer() { if (handle) hybris_gralloc_release(handle, 1); }
 };
-struct Pending { Buffer *buffer; uint32_t serial; Pending *next; };
+struct Pending { Buffer *buffer; uint32_t serial; bool checked, released; Pending *next; };
+struct Submission { Buffer *buffer; int fence; Submission *next; };
 struct Owner {
     hybris_icd_window base;
     xcb_connection_t *connection;
@@ -47,6 +49,11 @@ struct Owner {
     unsigned trace_count;
     Pending *pending;
     pthread_mutex_t mutex;
+    pthread_cond_t work_ready, idle;
+    pthread_t worker;
+    Submission *work_head, *work_tail;
+    bool worker_started, busy, stopping, draining;
+    int asynchronous_error;
 };
 static Owner *get(hybris_icd_window *o) { return reinterpret_cast<Owner *>(o); }
 static void trace(Owner *o, const char *event, const Pending *p) {
@@ -82,9 +89,14 @@ static void drain(Owner *o) {
             Pending **link = &o->pending;
             while (*link && (*link)->serial != serial) link = &(*link)->next;
             if (*link) {
-                Pending *p = *link; *link = p->next;
+                Pending *p = *link;
+                /* The server may release while the presenter checks its
+                 * request. Keep ownership until both operations complete. */
+                if (!p->checked) { p->released = true; free(event); continue; }
+                *link = p->next;
                 trace(o, "release", p);
                 p->buffer->held = false;
+                p->buffer->queued = false;
                 p->buffer->common.decRef(&p->buffer->common);
                 free(p);
             }
@@ -98,13 +110,19 @@ static void drop_pool(Owner *o) {
 }
 static void disconnect(hybris_icd_window *base) {
     Owner *o = get(base); pthread_mutex_lock(&o->mutex);
-    drain(o); drop_pool(o); pthread_mutex_unlock(&o->mutex);
+    o->draining = true;
+    while (o->work_head || o->busy) pthread_cond_wait(&o->idle, &o->mutex);
+    drain(o); drop_pool(o); o->draining = false;
+    pthread_mutex_unlock(&o->mutex);
 }
 static int configure(hybris_icd_window *base, unsigned width, unsigned height,
     int format, unsigned usage, unsigned count) {
     if (!width || !height || width > INT_MAX || height > INT_MAX || count < 2 || count > 8) return -EINVAL;
     Owner *o = get(base); pthread_mutex_lock(&o->mutex);
-    if (o->count) { pthread_mutex_unlock(&o->mutex); return -EBUSY; }
+    if (o->count || o->draining || o->stopping || o->busy || o->work_head) {
+        pthread_mutex_unlock(&o->mutex); return -EBUSY;
+    }
+    o->asynchronous_error = 0;
     o->pool_width = width; o->pool_height = height;
     int error = 0;
     for (unsigned i = 0; i < count; ++i) {
@@ -129,6 +147,9 @@ static int dequeue(hybris_icd_window *base, int64_t timeout, ANativeWindowBuffer
     int error;
     for (;;) {
         drain(o);
+        if (o->asynchronous_error || o->stopping || o->draining || !o->count) {
+            error = o->asynchronous_error ? o->asynchronous_error : -EPIPE; break;
+        }
         if (xcb_connection_has_error(o->connection)) { error = -EPIPE; break; }
         /* Configure events change the surface size, not the allocation or
          * release status of this pool. WSI reports SUBOPTIMAL to the caller. */
@@ -141,21 +162,26 @@ static int dequeue(hybris_icd_window *base, int64_t timeout, ANativeWindowBuffer
         if (!timeout) { error = -EAGAIN; break; }
         int64_t remaining = timeout < 0 ? INT64_MAX : timeout - (now_ns() - start);
         if (remaining <= 0) { error = -ETIMEDOUT; break; }
-        /* An application thread can read X events into this private queue
-         * while we poll. Periodically drain it without consuming app events. */
-        int milliseconds = remaining >= 50000000 ? 50 : (int)((remaining + 999999) / 1000000);
+        /* Another XCB reader can put a release in the private queue and
+         * consume socket readability while we poll. A 50-ms recheck stalls
+         * acquisition despite an already available buffer. Recheck at 1-ms
+         * intervals without consuming application events. */
+        int milliseconds = 1;
         pollfd p = {xcb_get_file_descriptor(o->connection), POLLIN, 0};
+        /* A queued submission can still be waiting for its GPU fence. Do not
+         * hold the pool lock while waiting: the presenter must be able to
+         * submit it and receive the release which makes progress possible. */
+        pthread_mutex_unlock(&o->mutex);
         int result = poll(&p, 1, milliseconds);
+        pthread_mutex_lock(&o->mutex);
         if ((result < 0 && errno != EINTR) || (p.revents & (POLLERR | POLLHUP | POLLNVAL))) {
             error = -EPIPE; break;
         }
     }
     pthread_mutex_unlock(&o->mutex); return error;
 }
-static int queue(hybris_icd_window *base, ANativeWindowBuffer *native, int fd) {
+static int present(Owner *o, Buffer *b, int fd) {
     int error = consume_fence(fd); if (error) return error;
-    Owner *o = get(base);
-    auto *b = static_cast<Buffer *>(static_cast<BaseNativeWindowBuffer *>(native));
     const native_handle_t *h = b->handle;
     if (!h || h->numFds < 0 || h->numFds > 64 || h->numInts < 0 || h->numInts > 1024) return -EINVAL;
     auto *p = static_cast<Pending *>(calloc(1, sizeof(Pending)));
@@ -187,12 +213,24 @@ static int queue(hybris_icd_window *base, ANativeWindowBuffer *native, int fd) {
     unsigned sequence = xcb_send_request_with_fds(o->connection, XCB_REQUEST_CHECKED,
         parts + 2, &request, h->numFds, fds);
     /* libxcb owns the duplicate FDs after send_request_with_fds. */
+    p->buffer = b; b->common.incRef(&b->common);
+    p->next = o->pending; o->pending = p;
+    trace(o, "present", p);
+    /* A checked X request is a server round trip. Do not hold the pool lock
+     * across it: other frames can acquire/queue while the presenter waits. */
+    pthread_mutex_unlock(&o->mutex);
     error = check(o->connection, sequence);
-    if (!error) {
-        p->buffer = b; b->common.incRef(&b->common); b->held = true;
-        p->next = o->pending; o->pending = p;
-        trace(o, "present", p);
-    } else {
+    pthread_mutex_lock(&o->mutex);
+    p->checked = true;
+    if (error || p->released) {
+        Pending **link = &o->pending;
+        while (*link != p) link = &(*link)->next;
+        *link = p->next;
+        b->held = b->queued = false;
+        b->common.decRef(&b->common);
+        if (error && !o->asynchronous_error) o->asynchronous_error = error;
+    }
+    if (error) {
         if (o->trace) {
             auto *attributes = xcb_get_window_attributes_reply(o->connection,
                 xcb_get_window_attributes(o->connection, o->window), nullptr);
@@ -200,14 +238,66 @@ static int queue(hybris_icd_window *base, ANativeWindowBuffer *native, int fd) {
                 o->window, p->serial, attributes ? attributes->map_state : -1);
             free(attributes);
         }
-        free(p);
     }
+    if (error || p->released) free(p);
     free(data); pthread_mutex_unlock(&o->mutex); return error;
+}
+static void *present_worker(void *argument) {
+    Owner *o = static_cast<Owner *>(argument);
+    pthread_mutex_lock(&o->mutex);
+    for (;;) {
+        while (!o->work_head && !o->stopping) pthread_cond_wait(&o->work_ready, &o->mutex);
+        if (!o->work_head) break;
+        Submission *s = o->work_head;
+        o->work_head = s->next;
+        if (!o->work_head) o->work_tail = nullptr;
+        o->busy = true;
+        pthread_mutex_unlock(&o->mutex);
+        int error = present(o, s->buffer, s->fence);
+        pthread_mutex_lock(&o->mutex);
+        if (error) {
+            if (!o->asynchronous_error) o->asynchronous_error = error;
+            s->buffer->held = s->buffer->queued = false;
+        }
+        s->buffer->common.decRef(&s->buffer->common);
+        free(s);
+        o->busy = false;
+        pthread_cond_broadcast(&o->idle);
+    }
+    pthread_mutex_unlock(&o->mutex);
+    return nullptr;
+}
+static int queue(hybris_icd_window *base, ANativeWindowBuffer *native, int fd) {
+    Owner *o = get(base);
+    auto *b = static_cast<Buffer *>(static_cast<BaseNativeWindowBuffer *>(native));
+    auto *s = static_cast<Submission *>(calloc(1, sizeof(Submission)));
+    if (!s) { if (fd >= 0) close(fd); return -ENOMEM; }
+    pthread_mutex_lock(&o->mutex);
+    drain(o);
+    bool owned = false;
+    for (unsigned i = 0; i < o->count; ++i) if (o->pool[i] == b) owned = true;
+    int error = o->asynchronous_error;
+    if (!error && (o->stopping || o->draining)) error = -EPIPE;
+    if (!error && (!owned || !b->held || b->queued)) error = -EINVAL;
+    if (!error) {
+        /* Transfer exactly one fence and buffer reference to the ordered
+         * presenter. Completion/release, not queue return, permits reuse. */
+        b->common.incRef(&b->common); b->queued = true;
+        s->buffer = b; s->fence = fd;
+        if (o->work_tail) o->work_tail->next = s;
+        else o->work_head = s;
+        o->work_tail = s;
+        pthread_cond_signal(&o->work_ready);
+    }
+    pthread_mutex_unlock(&o->mutex);
+    if (error) { if (fd >= 0) close(fd); free(s); }
+    return error;
 }
 static int cancel(hybris_icd_window *base, ANativeWindowBuffer *native, int fd) {
     int error = consume_fence(fd); if (error) return error;
     Owner *o = get(base); pthread_mutex_lock(&o->mutex);
-    for (unsigned i = 0; i < o->count; ++i) if (static_cast<ANativeWindowBuffer *>(o->pool[i]) == native) o->pool[i]->held = false;
+    for (unsigned i = 0; i < o->count; ++i)
+        if (static_cast<ANativeWindowBuffer *>(o->pool[i]) == native && !o->pool[i]->queued) o->pool[i]->held = false;
     pthread_mutex_unlock(&o->mutex); return 0;
 }
 static int extent(hybris_icd_window *base, uint32_t *width, uint32_t *height) {
@@ -220,12 +310,18 @@ static int extent(hybris_icd_window *base, uint32_t *width, uint32_t *height) {
 }
 static void destroy(hybris_icd_window *base) {
     Owner *o = get(base);
-    select(o, 0); xcb_unregister_for_special_event(o->connection, o->events);
+    pthread_mutex_lock(&o->mutex); o->stopping = true;
+    pthread_cond_signal(&o->work_ready); pthread_mutex_unlock(&o->mutex);
+    if (o->worker_started) pthread_join(o->worker, nullptr);
+    if (o->events) {
+        select(o, 0); xcb_unregister_for_special_event(o->connection, o->events);
+    }
     drop_pool(o);
     while (o->pending) {
         Pending *p = o->pending; o->pending = p->next;
         p->buffer->common.decRef(&p->buffer->common); free(p);
     }
+    pthread_cond_destroy(&o->work_ready); pthread_cond_destroy(&o->idle);
     pthread_mutex_destroy(&o->mutex); free(o);
 }
 static const hybris_icd_window_ops ops = {configure, dequeue, queue, cancel, disconnect, destroy, extent};
@@ -265,9 +361,13 @@ int hybris_icd_window_xcb(xcb_connection_t *connection, uint32_t window, hybris_
     o->trace = logging && !strcmp(logging, "1");
     o->base.ops = &ops; o->connection = connection; o->window = window; o->eid = xcb_generate_id(connection);
     pthread_mutex_init(&o->mutex, nullptr);
+    pthread_cond_init(&o->work_ready, nullptr); pthread_cond_init(&o->idle, nullptr);
     o->events = xcb_register_for_special_xge(connection, &extension, o->eid, nullptr);
-    if (!o->events) { pthread_mutex_destroy(&o->mutex); free(o); return -ENOMEM; }
+    if (!o->events) { destroy(&o->base); return -ENOMEM; }
     int result = select(o, TAWC_DRI_EVENT_MASK_CONFIGURE_NOTIFY | TAWC_DRI_EVENT_MASK_BUFFER_RELEASE);
     if (result) { destroy(&o->base); return result; }
+    result = pthread_create(&o->worker, nullptr, present_worker, o);
+    if (result) { destroy(&o->base); return -result; }
+    o->worker_started = true;
     *out = &o->base; return 0;
 }

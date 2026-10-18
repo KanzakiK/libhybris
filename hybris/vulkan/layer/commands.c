@@ -40,6 +40,7 @@ struct command_state {
     PFN_vkCmdBeginRendering begin_rendering;
     struct retained_resource *resources;
     struct command_state *next;
+    struct command_state *lookup_next;
 };
 struct pool_state {
     VkCommandPool handle;
@@ -52,12 +53,27 @@ struct pool_state {
 static pthread_mutex_t guard = PTHREAD_MUTEX_INITIALIZER;
 static struct command_state *commands;
 static struct pool_state *pools;
+#define COMMAND_BUCKETS 1024
+static struct command_state *command_index[COMMAND_BUCKETS];
+static size_t command_bucket(VkCommandBuffer handle)
+{
+    uintptr_t key = (uintptr_t)handle;
+    key ^= key >> 17;
+    key ^= key >> 9;
+    return (key >> 4) & (COMMAND_BUCKETS - 1);
+}
+/* Caller holds guard. Keep hot lookups independent of the retirement list. */
+static struct command_state *find_command_locked(VkCommandBuffer handle)
+{
+    struct command_state *state = command_index[command_bucket(handle)];
+    while (state && state->handle != handle) state = state->lookup_next;
+    return state;
+}
 /* Recording/freeing a particular command is externally synchronized by Vulkan. */
 static struct command_state *find_command(VkCommandBuffer handle)
 {
     pthread_mutex_lock(&guard);
-    struct command_state *state=commands;
-    while(state && state->handle!=handle) state=state->next;
+    struct command_state *state=find_command_locked(handle);
     pthread_mutex_unlock(&guard);return state;
 }
 
@@ -132,8 +148,8 @@ int hybris_layer_command_device(VkCommandBuffer command, struct hybris_layer_dev
     VkDevice owner = VK_NULL_HANDLE;
     uint64_t generation = 0;
     pthread_mutex_lock(&guard);
-    for (const struct command_state *state = commands; state; state = state->next)
-        if (state->handle == command) { owner = state->device; generation = state->generation; break; }
+    const struct command_state *state = find_command_locked(command);
+    if (state) { owner = state->device; generation = state->generation; }
     pthread_mutex_unlock(&guard);
     return owner && hybris_layer_lookup_device(owner, device) && device->generation == generation;
 }
@@ -225,6 +241,9 @@ static VkResult VKAPI_CALL allocate_commands(VkDevice handle, const VkCommandBuf
         struct command_state *state = list;
         list = state->next;
         state->handle = out[i];
+        size_t bucket = command_bucket(state->handle);
+        state->lookup_next = command_index[bucket];
+        command_index[bucket] = state;
         state->next = commands;
         commands = state;
     }
@@ -246,6 +265,10 @@ static struct command_state *detach(const struct hybris_layer_device *device, Vk
             continue;
         }
         *link = state->next;
+        struct command_state **indexed = &command_index[command_bucket(state->handle)];
+        while (*indexed && *indexed != state) indexed = &(*indexed)->lookup_next;
+        if (*indexed) *indexed = state->lookup_next;
+        state->lookup_next = NULL;
         state->next = retired;
         retired = state;
     }
