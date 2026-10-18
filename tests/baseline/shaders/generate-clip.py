@@ -7,7 +7,7 @@ import tempfile
 here = Path(__file__).resolve().parent
 with tempfile.TemporaryDirectory(prefix='hybris-clip-') as tmp:
     output = []
-    for name, source in [('Vertex', 'clip.vert'), ('Fragment', 'clip.frag'), ('CullVertex', 'clip.vert'), ('BlockCullVertex', 'clip.vert'), ('SpanVertex', 'clip.vert'), ('WideVertex', 'clip.vert'), ('MemberVertex', 'clip.vert')]:
+    for name, source in [('Vertex', 'clip.vert'), ('Fragment', 'clip.frag'), ('CullVertex', 'clip.vert'), ('BlockCullVertex', 'clip.vert'), ('SpanVertex', 'clip.vert'), ('WideVertex', 'clip.vert'), ('MemberVertex', 'clip.vert'), ('InitializedVertex', 'clip.vert')]:
         path = Path(tmp) / (name + '.spv')
         stage = 'vert' if source.endswith('.vert') else 'frag'
         options = ['-DACTIVE_CULL=1'] if name == 'CullVertex' else []
@@ -16,9 +16,33 @@ with tempfile.TemporaryDirectory(prefix='hybris-clip-') as tmp:
         for span, fixture in enumerate(('SpanVertex', 'WideVertex', 'MemberVertex'), 1):
             if name == fixture:
                 options = [f'-DLOCATION_SPAN={span}']
+        if name == 'InitializedVertex':
+            options = ['-DLOCATION_SPAN=1']
         subprocess.run(['glslangValidator', '-V', '-S', stage, *options, str(here / source), '-o', str(path)], check=True)
         data = path.read_bytes()
         words = list(struct.unpack('<' + 'I' * (len(data) // 4), data))
+        if name == 'InitializedVertex':
+            # D3D9 DXVK emits initialized interface outputs. Initialize the
+            # occupied matrix so planning must retain its four locations.
+            instructions = []
+            at = 5
+            while at < len(words):
+                count = words[at] >> 16
+                instructions.append(words[at:at + count])
+                at += count
+            variable, = [p[1] for p in instructions if p[0] & 65535 == 71 and p[2:] == [30, 16]]
+            pointer, = [p[1] for p in instructions if p[0] & 65535 == 59 and p[2] == variable]
+            value_type, = [p[3] for p in instructions if p[0] & 65535 == 32 and p[1] == pointer]
+            initializer = words[3]
+            words[3] += 1
+            changed = []
+            for p in instructions:
+                if p[0] & 65535 == 59 and p[2] == variable:
+                    changed += [(3 << 16) | 46, value_type, initializer]  # OpConstantNull
+                    p = [(5 << 16) | 59, *p[1:], initializer]
+                changed += p
+            words = words[:5] + changed
+            path.write_bytes(struct.pack('<' + 'I' * len(words), *words))
         if name == 'CullVertex':
             # GLSL groups built-ins in gl_PerVertex. Exercise the legal separate
             # SPIR-V variable form too, with an active two-distance output.

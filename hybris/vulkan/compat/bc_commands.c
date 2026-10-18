@@ -38,6 +38,7 @@ static VkResult VKAPI_CALL allocate_commands(VkDevice handle, const VkCommandBuf
         first->handle = handles[i];
         first->next = device->commands;
         device->commands = first;
+        hybris_bc_command_publish(device, first);
         first = next;
     }
     pthread_mutex_unlock(&device->guard);
@@ -49,7 +50,10 @@ static void remove_command(struct hybris_bc_device *device, VkCommandBuffer hand
     struct hybris_bc_command **link = &device->commands;
     while (*link && (*link)->handle != handle) link = &(*link)->next;
     struct hybris_bc_command *command = *link;
-    if (command) *link = command->next;
+    if (command) {
+        *link = command->next;
+        hybris_bc_command_unpublish(command);
+    }
     pthread_mutex_unlock(&device->guard);
     if (command) { hybris_bc_command_retire(command); hybris_bc_free(device, command); }
 }
@@ -107,6 +111,7 @@ static struct hybris_bc_command *detach_pool(struct hybris_bc_device *device, Vk
         struct hybris_bc_command *command = *link;
         if (command->pool != pool) { link = &command->next; continue; }
         *link = command->next;
+        hybris_bc_command_unpublish(command);
         command->next = retired;
         retired = command;
     }
@@ -128,6 +133,7 @@ static VkResult VKAPI_CALL reset_pool(VkDevice handle, VkCommandPool pool, VkCom
         struct hybris_bc_command *next = retired->next;
         retired->next = device->commands;
         device->commands = retired;
+        hybris_bc_command_publish(device, retired);
         retired = next;
     }
     pthread_mutex_unlock(&device->guard);

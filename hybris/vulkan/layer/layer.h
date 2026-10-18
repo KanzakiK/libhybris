@@ -12,6 +12,27 @@ struct hybris_layer_physical {
     PFN_vkGetInstanceProcAddr resolver;
     unsigned application_policy;
 };
+/* Resolved once per device, before publication. Internal targets retain the
+ * BC/shader/resource hooks; the command journal remains the outer wrapper. */
+#define HYBRIS_LAYER_RECORDING_PROCS(X) \
+    X(CmdDraw, CmdDraw) \
+    X(CmdDrawIndexed, CmdDrawIndexed) \
+    X(CmdBindVertexBuffers, CmdBindVertexBuffers) \
+    X(CmdBindVertexBuffers2, CmdBindVertexBuffers2) \
+    X(CmdBindVertexBuffers2EXT, CmdBindVertexBuffers2EXT) \
+    X(CmdBindIndexBuffer, CmdBindIndexBuffer) \
+    X(CmdBindIndexBuffer2, CmdBindIndexBuffer2KHR) \
+    X(CmdBindIndexBuffer2KHR, CmdBindIndexBuffer2KHR) \
+    X(CmdSetViewport, CmdSetViewport) \
+    X(CmdBeginQuery, CmdBeginQuery) \
+    X(CmdEndQuery, CmdEndQuery) \
+    X(CmdBeginQueryIndexedEXT, CmdBeginQueryIndexedEXT) \
+    X(CmdEndQueryIndexedEXT, CmdEndQueryIndexedEXT)
+struct hybris_layer_command_dispatch {
+#define HYBRIS_RECORDING_FIELD(n, type) PFN_vk##type n;
+    HYBRIS_LAYER_RECORDING_PROCS(HYBRIS_RECORDING_FIELD)
+#undef HYBRIS_RECORDING_FIELD
+};
 struct hybris_layer_device {
     VkDevice handle;
     PFN_vkGetDeviceProcAddr resolver;
@@ -19,6 +40,7 @@ struct hybris_layer_device {
     uint64_t generation;
     unsigned application_policy;
     int track_commands;
+    const struct hybris_layer_command_dispatch *recording;
     uint64_t instance_generation;
 };
 int hybris_layer_lookup_physical(VkPhysicalDevice physical, struct hybris_layer_physical *out);

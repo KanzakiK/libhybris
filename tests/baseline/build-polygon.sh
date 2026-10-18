@@ -3,6 +3,16 @@ set -euo pipefail
 repo=$(cd "$(dirname "$0")/../.." && pwd)
 out=${OUT:?Set OUT to an isolated build directory}
 mkdir -p "$out"
+"${HOST_CC:-cc}" -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections \
+    -I"$repo/hybris/vulkan/compat" \
+    "$repo/tests/baseline/command_lookup_check.c" "$repo/hybris/vulkan/compat/bc_context.c" \
+    -Wl,--gc-sections -pthread -o "$out/command-lookup-check"
+"$out/command-lookup-check"
+"${HOST_CC:-cc}" -O2 -Wall -Wextra -Werror -ffunction-sections -fdata-sections \
+    -I"$repo/hybris/vulkan/compat" \
+    "$repo/tests/baseline/command_index_lifetime_check.c" "$repo/hybris/vulkan/compat/bc_command_state.c" \
+    -Wl,--gc-sections -pthread -o "$out/command-index-lifetime-check"
+"$out/command-index-lifetime-check"
 "${HOST_CC:-cc}" -O2 -Wall -Wextra -I"$repo/hybris/vulkan/compat" \
     "$repo/tests/baseline/command_state_check.c" "$repo/hybris/vulkan/compat/bc_command_state.c" \
     -pthread -o "$out/command-state-check"

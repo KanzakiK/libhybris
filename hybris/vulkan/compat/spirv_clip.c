@@ -86,7 +86,9 @@ static int parse_ids(const uint32_t *code, size_t words, struct parse_id *ids, u
             ids[p[2]].at = (uint32_t)at;
             ids[p[2]].type = p[1];
             ids[p[2]].value = p[3];
-        } else if (op == 59 && count == 4 && p[2] && p[2] < bound) {
+        } else if (op == 59 && (count == 4 || count == 5) && p[2] && p[2] < bound) {
+            /* OpVariable has an optional initializer. DXVK's D3D9 shaders use
+             * initialized outputs; their types still occupy interface locations. */
             ids[p[2]].op = op;
             ids[p[2]].at = (uint32_t)at;
             ids[p[2]].type = p[1];

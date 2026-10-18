@@ -130,7 +130,7 @@ static __attribute__((tls_model ("initial-exec"), aligned(16)))
        __thread char tls_static_tls[BIONIC_STATIC_TLS_SIZE];
 /* Per-thread "how many promoted-TLS-module entries from the global
  * registry have been replayed into this thread's tls_static_tls".
- * Compared against g_promoted_tls.count on first bionic-side touch
+ * Compared against the published registry generation on bionic-side touch
  * (_hybris_hook___get_tls_hooks) to catch up modules promoted before
  * this thread first ran any bionic code. */
 static __attribute__((tls_model ("initial-exec")))
@@ -179,6 +179,10 @@ static struct {
     int capacity;
     pthread_mutex_t mutex;
 } g_promoted_tls = { NULL, 0, 0, PTHREAD_MUTEX_INITIALIZER };
+
+/* Published only after the registry entry and the promoter's TLS are ready.
+ * Readers with no missing entries need neither the mutex nor the registry. */
+static int g_promoted_tls_published;
 
 static void hybris_apply_static_tls_locked(const struct hybris_promoted_tls* e)
 {
@@ -255,6 +259,7 @@ void _hybris_init_static_tls_for_thread(size_t static_offset,
         hybris_apply_static_tls_locked(&g_promoted_tls.entries[i]);
     }
     tls_module_init_count = g_promoted_tls.count;
+    __atomic_store_n(&g_promoted_tls_published, g_promoted_tls.count, __ATOMIC_RELEASE);
     pthread_mutex_unlock(&g_promoted_tls.mutex);
 }
 
@@ -309,24 +314,23 @@ void *_hybris_hook___get_tls_hooks()
      * already inited still picks up newly-promoted modules on its next
      * hooked-libc call.
      *
-     * Take the mutex before reading .count: the writer
-     * (_hybris_init_static_tls_for_thread) mutates count under the same
-     * lock, and an unsynchronised read here is a C data race. Reads of
-     * tls_module_init_count itself need no lock -- it's a per-thread
-     * __thread int with single-writer (this thread).
+     * The acquire load checks whether this thread needs new entries. Only
+     * the slow path reads the registry and .count, under the writer's mutex.
+     * tls_module_init_count is private to this thread.
      *
      * Q's static TLSDESC resolver also calls this hook before returning
      * the offset, so pure TLSDESC first touches catch up without a libc
      * call. IE accesses that bypass that resolver still require an
      * initialized thread. */
-    pthread_mutex_lock(&g_promoted_tls.mutex);
-    if (__builtin_expect(tls_module_init_count < g_promoted_tls.count, 0)) {
+    if (__builtin_expect(tls_module_init_count !=
+            __atomic_load_n(&g_promoted_tls_published, __ATOMIC_ACQUIRE), 0)) {
+        pthread_mutex_lock(&g_promoted_tls.mutex);
         for (int i = tls_module_init_count; i < g_promoted_tls.count; i++) {
             hybris_apply_static_tls_locked(&g_promoted_tls.entries[i]);
         }
         tls_module_init_count = g_promoted_tls.count;
+        pthread_mutex_unlock(&g_promoted_tls.mutex);
     }
-    pthread_mutex_unlock(&g_promoted_tls.mutex);
 
     return tls_static_tls + BIONIC_TPIDR_OFFSET;
 }

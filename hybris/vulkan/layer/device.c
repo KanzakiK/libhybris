@@ -21,6 +21,7 @@
 
 struct device_state {
     struct hybris_layer_device device;
+    struct hybris_layer_command_dispatch recording;
     void *key;
     VkAllocationCallbacks allocator;
     int custom_allocator;
@@ -56,6 +57,18 @@ int hybris_layer_device_allocator(VkDevice handle, VkAllocationCallbacks *out)
         }
     pthread_mutex_unlock(&guard);
     return custom;
+}
+
+static PFN_vkVoidFunction resolve_inner(const struct hybris_layer_device *device, const char *name)
+{
+    if (!hybris_shader_device_proc_allowed(device->handle, name)) return NULL;
+    PFN_vkVoidFunction next = device->resolver(device->handle, name);
+    if (!next) return NULL;
+    PFN_vkVoidFunction compat = hybris_bc_proc(name);
+    if (!compat) compat = hybris_shader_cleanup_proc(name);
+    if (!compat) compat = hybris_shader_proc(name);
+    if (!compat) compat = hybris_vertex_stores_proc(name);
+    return compat ? compat : next;
 }
 
 VkResult VKAPI_CALL hybris_layer_create_device(VkPhysicalDevice physical,
@@ -111,6 +124,22 @@ VkResult VKAPI_CALL hybris_layer_create_device(VkPhysicalDevice physical,
         hybris_scaled_free(allocator, state);
         return result;
     }
+    state->device.recording = &state->recording;
+#define HYBRIS_RESOLVE_RECORDING(n, type) state->recording.n = (PFN_vk##type)resolve_inner(&state->device, "vk" #n);
+    HYBRIS_LAYER_RECORDING_PROCS(HYBRIS_RESOLVE_RECORDING)
+#undef HYBRIS_RESOLVE_RECORDING
+    /* Preserve the visibility hooks used by the recording wrapper. */
+#define HYBRIS_RESOLVE_RESOURCE(n, type) do { \
+    PFN_vkVoidFunction hook = hybris_memory_visibility_proc("vk" #n); \
+    if (state->recording.n && hook) state->recording.n = (PFN_vk##type)hook; \
+} while (0)
+    HYBRIS_RESOLVE_RESOURCE(CmdBindVertexBuffers, CmdBindVertexBuffers);
+    HYBRIS_RESOLVE_RESOURCE(CmdBindVertexBuffers2, CmdBindVertexBuffers2);
+    HYBRIS_RESOLVE_RESOURCE(CmdBindVertexBuffers2EXT, CmdBindVertexBuffers2EXT);
+    HYBRIS_RESOLVE_RESOURCE(CmdBindIndexBuffer, CmdBindIndexBuffer);
+    HYBRIS_RESOLVE_RESOURCE(CmdBindIndexBuffer2, CmdBindIndexBuffer2KHR);
+    HYBRIS_RESOLVE_RESOURCE(CmdBindIndexBuffer2KHR, CmdBindIndexBuffer2KHR);
+#undef HYBRIS_RESOLVE_RESOURCE
     pthread_mutex_lock(&guard);
     state->next = devices;
     devices = state;
@@ -146,15 +175,8 @@ void VKAPI_CALL hybris_layer_destroy_device(VkDevice handle, const VkAllocationC
 PFN_vkVoidFunction hybris_layer_device_inner_proc(VkDevice handle, const char *name)
 {
     struct hybris_layer_device device;
-    if (!name || !hybris_layer_lookup_device(handle, &device) ||
-        !hybris_shader_device_proc_allowed(handle, name)) return NULL;
-    PFN_vkVoidFunction next = device.resolver(handle, name);
-    if (!next) return NULL;
-    PFN_vkVoidFunction compat = hybris_bc_proc(name);
-    if (!compat) compat = hybris_shader_cleanup_proc(name);
-    if (!compat) compat = hybris_shader_proc(name);
-    if (!compat) compat = hybris_vertex_stores_proc(name);
-    return compat ? compat : next;
+    if (!name || !hybris_layer_lookup_device(handle, &device)) return NULL;
+    return resolve_inner(&device, name);
 }
 PFN_vkVoidFunction hybris_layer_device_dispatch(const char *name, int track_commands)
 {

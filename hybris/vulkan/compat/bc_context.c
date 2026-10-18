@@ -7,6 +7,36 @@
 
 static pthread_mutex_t guard = PTHREAD_MUTEX_INITIALIZER;
 static struct hybris_bc_device *devices;
+/* Driver handles are preserved. Recording needs only one indexed bucket
+ * lookup, rather than scanning every device and every command buffer. */
+#define COMMAND_BUCKETS 1024
+static struct hybris_bc_command *command_index[COMMAND_BUCKETS];
+static size_t command_bucket(VkCommandBuffer handle)
+{
+    uintptr_t key = (uintptr_t)handle;
+    key ^= key >> 17;
+    key ^= key >> 9;
+    return (key >> 4) & (COMMAND_BUCKETS - 1);
+}
+void hybris_bc_command_publish(struct hybris_bc_device *device, struct hybris_bc_command *command)
+{
+    size_t bucket = command_bucket(command->handle);
+    pthread_mutex_lock(&guard);
+    command->owner = device;
+    command->lookup_next = command_index[bucket];
+    command_index[bucket] = command;
+    pthread_mutex_unlock(&guard);
+}
+void hybris_bc_command_unpublish(struct hybris_bc_command *command)
+{
+    pthread_mutex_lock(&guard);
+    struct hybris_bc_command **link = &command_index[command_bucket(command->handle)];
+    while (*link && *link != command) link = &(*link)->lookup_next;
+    if (*link) *link = command->lookup_next;
+    command->lookup_next = NULL;
+    command->owner = NULL;
+    pthread_mutex_unlock(&guard);
+}
 void *hybris_bc_alloc(struct hybris_bc_device *device, size_t size)
 {
     void *memory = device->custom_allocator ? device->allocator.pfnAllocation(
@@ -57,15 +87,10 @@ struct hybris_bc_device *hybris_bc_device_find(VkDevice handle)
 }
 struct hybris_bc_command *hybris_bc_command_find(VkCommandBuffer handle, struct hybris_bc_device **owner)
 {
-    struct hybris_bc_command *command = NULL;
-    *owner = NULL;
     pthread_mutex_lock(&guard);
-    for (struct hybris_bc_device *device = devices; device && !command; device = device->next) {
-        pthread_mutex_lock(&device->guard);
-        for (command = device->commands; command && command->handle != handle; command = command->next) {}
-        if (command) *owner = device;
-        pthread_mutex_unlock(&device->guard);
-    }
+    struct hybris_bc_command *command = command_index[command_bucket(handle)];
+    while (command && command->handle != handle) command = command->lookup_next;
+    *owner = command ? command->owner : NULL;
     pthread_mutex_unlock(&guard);
     return command;
 }
@@ -94,6 +119,7 @@ void hybris_bc_device_remove(VkDevice handle)
     if (!device) return;
     while (device->commands) {
         struct hybris_bc_command *next = device->commands->next;
+        hybris_bc_command_unpublish(device->commands);
         hybris_bc_command_retire(device->commands);
         hybris_bc_free(device, device->commands);
         device->commands = next;

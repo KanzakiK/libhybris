@@ -128,10 +128,10 @@ int main(int argc, char **argv)
         free(vs);
     }
     puts("CULL_EXTRACT separate and block outputs preserve ClipDistance spirv-val=ok");
-    const uint32_t *span_inputs[] = {kClipSpanVertex, kClipWideVertex, kClipMemberVertex};
-    const size_t span_sizes[] = {sizeof(kClipSpanVertex), sizeof(kClipWideVertex), sizeof(kClipMemberVertex)};
-    const uint32_t expected_locations[] = {22, 19, 20};
-    for (unsigned fixture = 0; fixture < 3; ++fixture) {
+    const uint32_t *span_inputs[] = {kClipSpanVertex, kClipWideVertex, kClipMemberVertex, kClipInitializedVertex};
+    const size_t span_sizes[] = {sizeof(kClipSpanVertex), sizeof(kClipWideVertex), sizeof(kClipMemberVertex), sizeof(kClipInitializedVertex)};
+    const uint32_t expected_locations[] = {22, 19, 20, 22};
+    for (unsigned fixture = 0; fixture < 4; ++fixture) {
         result = hybris_spirv_clip_plan(span_inputs[fixture], span_sizes[fixture],
             kClipFragment, sizeof(kClipFragment), &location, &count);
         if (result != VK_SUCCESS || count != 6 || location != expected_locations[fixture]) {
@@ -146,6 +146,6 @@ int main(int argc, char **argv)
         if (!write_spv(path, vs, vs_size) || !validate(path)) { free(vs); return 1; }
         free(vs);
     }
-    puts("DISTANCE_PLAN matrix/array/wide/member location spans preserved spirv-val=ok");
+    puts("DISTANCE_PLAN matrix/array/wide/member/initialized location spans preserved spirv-val=ok");
     return 0;
 }

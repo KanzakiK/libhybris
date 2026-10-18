@@ -431,11 +431,6 @@ static void end_rendering(VkCommandBuffer command,const char *name)
 }
 static void VKAPI_CALL end_core(VkCommandBuffer c) {end_rendering(c,"vkCmdEndRendering");}
 static void VKAPI_CALL end_khr(VkCommandBuffer c) {end_rendering(c,"vkCmdEndRenderingKHR");}
-static PFN_vkVoidFunction resource_inner(const struct hybris_layer_device *device,const char *name)
-{
-    PFN_vkVoidFunction compatibility=hybris_memory_visibility_proc(name);
-    return compatibility ? compatibility : inner(device,name);
-}
 static void vertex_state(VkCommandBuffer c,uint32_t first,uint32_t count,const VkBuffer *buffers,
     const VkDeviceSize *offsets,const VkDeviceSize *sizes)
 {
@@ -451,22 +446,22 @@ static void VKAPI_CALL bind_vertices(VkCommandBuffer c,uint32_t first,uint32_t c
     const VkBuffer *buffers,const VkDeviceSize *offsets)
 {
     struct hybris_layer_device device;if(!hybris_layer_command_device(c,&device)) return;
-    ((PFN_vkCmdBindVertexBuffers)resource_inner(&device,"vkCmdBindVertexBuffers"))(c,first,count,buffers,offsets);
+    device.recording->CmdBindVertexBuffers(c,first,count,buffers,offsets);
     vertex_state(c,first,count,buffers,offsets,NULL);
 }
 static void bind_vertices2(VkCommandBuffer c,uint32_t first,uint32_t count,const VkBuffer *buffers,
-    const VkDeviceSize *offsets,const VkDeviceSize *sizes,const VkDeviceSize *strides,const char *name)
+    const VkDeviceSize *offsets,const VkDeviceSize *sizes,const VkDeviceSize *strides,int extension)
 {
     struct hybris_layer_device device;if(!hybris_layer_command_device(c,&device)) return;
-    ((PFN_vkCmdBindVertexBuffers2)resource_inner(&device,name))(c,first,count,buffers,offsets,sizes,strides);
+    (extension ? device.recording->CmdBindVertexBuffers2EXT : device.recording->CmdBindVertexBuffers2)(c,first,count,buffers,offsets,sizes,strides);
     vertex_state(c,first,count,buffers,offsets,sizes);
 }
 static void VKAPI_CALL vertices_core(VkCommandBuffer c,uint32_t f,uint32_t n,const VkBuffer *b,
     const VkDeviceSize *o,const VkDeviceSize *s,const VkDeviceSize *t)
-{bind_vertices2(c,f,n,b,o,s,t,"vkCmdBindVertexBuffers2");}
+{bind_vertices2(c,f,n,b,o,s,t,0);}
 static void VKAPI_CALL vertices_ext(VkCommandBuffer c,uint32_t f,uint32_t n,const VkBuffer *b,
     const VkDeviceSize *o,const VkDeviceSize *s,const VkDeviceSize *t)
-{bind_vertices2(c,f,n,b,o,s,t,"vkCmdBindVertexBuffers2EXT");}
+{bind_vertices2(c,f,n,b,o,s,t,1);}
 static void index_state(VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,VkDeviceSize size,VkIndexType type)
 {
     struct command_state *state=find_command(c);if(!state) return;
@@ -475,23 +470,23 @@ static void index_state(VkCommandBuffer c,VkBuffer buffer,VkDeviceSize offset,Vk
 static void VKAPI_CALL bind_index(VkCommandBuffer c,VkBuffer b,VkDeviceSize o,VkIndexType t)
 {
     struct hybris_layer_device device;if(!hybris_layer_command_device(c,&device)) return;
-    ((PFN_vkCmdBindIndexBuffer)resource_inner(&device,"vkCmdBindIndexBuffer"))(c,b,o,t);
+    device.recording->CmdBindIndexBuffer(c,b,o,t);
     index_state(c,b,o,VK_WHOLE_SIZE,t);
 }
-static void bind_index2(VkCommandBuffer c,VkBuffer b,VkDeviceSize o,VkDeviceSize s,VkIndexType t,const char *name)
+static void bind_index2(VkCommandBuffer c,VkBuffer b,VkDeviceSize o,VkDeviceSize s,VkIndexType t,int extension)
 {
     struct hybris_layer_device device;if(!hybris_layer_command_device(c,&device)) return;
-    ((PFN_vkCmdBindIndexBuffer2KHR)resource_inner(&device,name))(c,b,o,s,t);
+    (extension ? device.recording->CmdBindIndexBuffer2KHR : device.recording->CmdBindIndexBuffer2)(c,b,o,s,t);
     index_state(c,b,o,s,t);
 }
 static void VKAPI_CALL index_core(VkCommandBuffer c,VkBuffer b,VkDeviceSize o,VkDeviceSize s,VkIndexType t)
-{bind_index2(c,b,o,s,t,"vkCmdBindIndexBuffer2");}
+{bind_index2(c,b,o,s,t,0);}
 static void VKAPI_CALL index_khr(VkCommandBuffer c,VkBuffer b,VkDeviceSize o,VkDeviceSize s,VkIndexType t)
-{bind_index2(c,b,o,s,t,"vkCmdBindIndexBuffer2KHR");}
+{bind_index2(c,b,o,s,t,1);}
 static void VKAPI_CALL viewport(VkCommandBuffer c,uint32_t first,uint32_t count,const VkViewport *viewports)
 {
     struct hybris_layer_device device;if(!hybris_layer_command_device(c,&device)) return;
-    ((PFN_vkCmdSetViewport)inner(&device,"vkCmdSetViewport"))(c,first,count,viewports);
+    device.recording->CmdSetViewport(c,first,count,viewports);
     struct command_state *state=find_command(c);
     if(state && !first && count) {state->viewport=viewports[0];state->viewport_valid=1;state->touched=1;}
 }
@@ -505,22 +500,22 @@ static void query_state(VkCommandBuffer c,int begin)
 static void VKAPI_CALL begin_query(VkCommandBuffer c,VkQueryPool pool,uint32_t q,VkQueryControlFlags flags)
 {
     struct hybris_layer_device device;if(!hybris_layer_command_device(c,&device)) return;
-    ((PFN_vkCmdBeginQuery)inner(&device,"vkCmdBeginQuery"))(c,pool,q,flags);query_state(c,1);
+    device.recording->CmdBeginQuery(c,pool,q,flags);query_state(c,1);
 }
 static void VKAPI_CALL end_query(VkCommandBuffer c,VkQueryPool pool,uint32_t q)
 {
     struct hybris_layer_device device;if(!hybris_layer_command_device(c,&device)) return;
-    ((PFN_vkCmdEndQuery)inner(&device,"vkCmdEndQuery"))(c,pool,q);query_state(c,0);
+    device.recording->CmdEndQuery(c,pool,q);query_state(c,0);
 }
 static void VKAPI_CALL begin_query_indexed(VkCommandBuffer c,VkQueryPool pool,uint32_t q,VkQueryControlFlags f,uint32_t i)
 {
     struct hybris_layer_device device;if(!hybris_layer_command_device(c,&device)) return;
-    ((PFN_vkCmdBeginQueryIndexedEXT)inner(&device,"vkCmdBeginQueryIndexedEXT"))(c,pool,q,f,i);query_state(c,1);
+    device.recording->CmdBeginQueryIndexedEXT(c,pool,q,f,i);query_state(c,1);
 }
 static void VKAPI_CALL end_query_indexed(VkCommandBuffer c,VkQueryPool pool,uint32_t q,uint32_t i)
 {
     struct hybris_layer_device device;if(!hybris_layer_command_device(c,&device)) return;
-    ((PFN_vkCmdEndQueryIndexedEXT)inner(&device,"vkCmdEndQueryIndexedEXT"))(c,pool,q,i);query_state(c,0);
+    device.recording->CmdEndQueryIndexedEXT(c,pool,q,i);query_state(c,0);
 }
 struct polygon_recording {
     struct hybris_polygon_pipeline *pipeline;
@@ -647,13 +642,13 @@ static void VKAPI_CALL draw(VkCommandBuffer c,uint32_t n,uint32_t instances,uint
 {
     struct hybris_layer_device device;if(!hybris_layer_command_device(c,&device)) return;
     if(!polygon_draw(c,&device,VK_FALSE,n,instances,first,0,base_instance))
-        ((PFN_vkCmdDraw)inner(&device,"vkCmdDraw"))(c,n,instances,first,base_instance);
+        device.recording->CmdDraw(c,n,instances,first,base_instance);
 }
 static void VKAPI_CALL draw_indexed(VkCommandBuffer c,uint32_t n,uint32_t instances,uint32_t first,int32_t offset,uint32_t base_instance)
 {
     struct hybris_layer_device device;if(!hybris_layer_command_device(c,&device)) return;
     if(!polygon_draw(c,&device,VK_TRUE,n,instances,first,offset,base_instance))
-        ((PFN_vkCmdDrawIndexed)inner(&device,"vkCmdDrawIndexed"))(c,n,instances,first,offset,base_instance);
+        device.recording->CmdDrawIndexed(c,n,instances,first,offset,base_instance);
 }
 
 

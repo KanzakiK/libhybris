@@ -47,8 +47,14 @@ VkResult hybris_polygon_raster_record(const struct hybris_polygon_pipeline *p,co
  struct hybris_bc_command_state *j,VkCommandBuffer c,VkPolygonMode m,VkDescriptorSet s,VkBuffer g,VkBuffer i,
  const struct hybris_polygon_source *v)
 {(void)p;(void)b;(void)j;(void)c;(void)m;(void)s;(void)g;(void)i;(void)v;assert(0);return VK_ERROR_UNKNOWN;}
+static unsigned recorded_draws;
+static void VKAPI_CALL record_draw(VkCommandBuffer c,uint32_t n,uint32_t instances,uint32_t first,uint32_t base)
+{ assert(c && n==3 && instances==2 && first==1 && base==4);++recorded_draws; }
+static void VKAPI_CALL record_indexed(VkCommandBuffer c,uint32_t n,uint32_t instances,uint32_t first,int32_t offset,uint32_t base)
+{ assert(c && n==3 && instances==2 && first==1 && offset==-2 && base==4);++recorded_draws; }
+static const struct hybris_layer_command_dispatch recording={.CmdDraw=record_draw,.CmdDrawIndexed=record_indexed};
 int hybris_layer_lookup_device(VkDevice d,struct hybris_layer_device *out)
-{ *out=(struct hybris_layer_device){.handle=d,.generation=1};return 1; }
+{ *out=(struct hybris_layer_device){.handle=d,.generation=1,.recording=&recording};return 1; }
 void hybris_readback_reset_command(VkCommandBuffer c) {(void)c;}
 void hybris_readback_reset_pool(VkDevice d,VkCommandPool p) {(void)d;(void)p;}
 static VKAPI_ATTR VkResult VKAPI_CALL create_pool(VkDevice d,const VkCommandPoolCreateInfo *i,
@@ -90,7 +96,7 @@ int main(void)
 #define PROC(n) PFN_vk##n n=(PFN_vk##n)hybris_layer_commands_proc("vk" #n)
  PROC(CreateCommandPool);PROC(AllocateCommandBuffers);PROC(BeginCommandBuffer);
  PROC(EndCommandBuffer);PROC(ResetCommandBuffer);PROC(ResetCommandPool);
- PROC(FreeCommandBuffers);PROC(DestroyCommandPool);
+ PROC(FreeCommandBuffers);PROC(DestroyCommandPool);PROC(CmdDraw);PROC(CmdDrawIndexed);
 #undef PROC
  VkDevice device=H(VkDevice,1);VkCommandPool a,b;
  VkCommandPoolCreateInfo pool={.sType=VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -102,6 +108,12 @@ int main(void)
  assert(AllocateCommandBuffers(device,&info,commands)==VK_SUCCESS);
  info.commandPool=b;info.commandBufferCount=1;
  assert(AllocateCommandBuffers(device,&info,commands+2)==VK_SUCCESS);
+ /* Recording dispatch is already resolved. Any name lookup here reaches
+  * the mock resolver's assertion rather than silently hiding hot-path work. */
+ for(unsigned i=0;i<32;++i) {
+  CmdDraw(commands[0],3,2,1,4);CmdDrawIndexed(commands[0],3,2,1,-2,4);
+ }
+ assert(recorded_draws==64);
  for(unsigned i=0;i<3;++i) assert(hybris_layer_command_retain(commands[i],(void*)(uintptr_t)(i+1),destroy_resource)==VK_SUCCESS);
  assert(EndCommandBuffer(commands[0])==VK_SUCCESS && destroyed==0);
  VkCommandBufferBeginInfo cb={.sType=VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};

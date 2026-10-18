@@ -10,6 +10,8 @@ struct hybris_bc_command {
     struct hybris_bc_command_state state;
     struct hybris_bc_transfer transfer;
     struct hybris_bc_command *next;
+    struct hybris_bc_command *lookup_next;
+    struct hybris_bc_device *owner;
 };
 struct hybris_bc_resource {
     VkImage handle;
@@ -44,6 +46,10 @@ VkResult hybris_bc_device_add(VkDevice handle, PFN_vkGetDeviceProcAddr resolver,
 void hybris_bc_device_remove(VkDevice handle);
 struct hybris_bc_device *hybris_bc_device_find(VkDevice handle);
 struct hybris_bc_command *hybris_bc_command_find(VkCommandBuffer handle, struct hybris_bc_device **owner);
+/* Index mutations precede retirement; callers externally synchronize the
+ * affected pool/command, just as for the underlying Vulkan object. */
+void hybris_bc_command_publish(struct hybris_bc_device *device, struct hybris_bc_command *command);
+void hybris_bc_command_unpublish(struct hybris_bc_command *command);
 struct hybris_bc_resource *hybris_bc_resource_find(struct hybris_bc_device *device, VkImage handle);
 void *hybris_bc_alloc(struct hybris_bc_device *device, size_t size);
 void hybris_bc_free(struct hybris_bc_device *device, void *memory);

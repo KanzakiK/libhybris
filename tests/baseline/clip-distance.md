@@ -220,3 +220,24 @@ the default scene, splash, text and toolbar, but repeated updates still report
 Mali GPU timeouts. The old black-frame observations above remain historical
 failures; current results and open acceptance limits are in
 [Blender Vulkan compatibility](../../docs/blender-vulkan-compat.md).
+
+## Initialized D3D9 outputs, 2026-10-18
+
+Heaven 4.0 through Bionic Wine/DXVK failed pipeline creation with
+`VK_ERROR_FEATURE_NOT_PRESENT` before reaching Mali. Its captured vertex shader
+has initialized output variables. SPIR-V `OpVariable` accepts an optional
+initializer, but the distance parser recognized only the four-word form;
+location planning therefore rejected otherwise valid initialized outputs.
+The parser now records both four- and five-word forms.
+
+`generate-clip.py` adds a validated fixture with an initialized matrix output
+occupying locations 16–19 and an array at 20–21. The existing rewrite check
+requires the clip varying to start at 22. This fixture fails on the old parser
+and passes on the correction; all previous clip/cull checks and rewritten
+SPIR-V validation also pass. The real captured Heaven vertex shader plans six
+distances at location 16 and its rewritten module passes Vulkan 1.1 validation.
+
+Fresh X300 product-instance rendering evidence and the candidate runtime hash
+are recorded in the parent ARLinux repository's
+`docs/X300-WINLATOR-PERFORMANCE.md`. This change does not disable clipping,
+change capability reporting, or substitute software rendering.
