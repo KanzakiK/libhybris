@@ -39,6 +39,7 @@ extern "C" {
 }
 
 #include <list>
+#include <atomic>
 
 class WaylandNativeWindow : public BaseNativeWindow {
 public:
@@ -52,6 +53,10 @@ public:
     void resize(unsigned int width, unsigned int height);
     void releaseBuffer(struct wl_buffer *buffer);
     int apiDisconnect(int api) override;
+    // Wake a presenter waiting for a frame callback on a hidden/closed surface.
+    // The owner drains its presenter before disconnecting/destroying the pool.
+    void stopPresentation();
+    bool presentationStopped() const { return presentation_stopped.load(); }
     /* timeout_ns < 0 waits until a buffer is free; 0 never blocks; > 0 waits
      * that many nanoseconds. Returns 0, -EAGAIN, -ETIMEDOUT or another -errno.
      * Does not replace the blocking ANativeWindow dequeue used by EGL. */
@@ -117,6 +122,7 @@ private:
     int m_swap_interval;
     struct wl_display *wl_dpy_wrapper;
     struct wl_surface *wl_surface_wrapper;
+    std::atomic<bool> presentation_stopped{false};
 };
 
 #endif

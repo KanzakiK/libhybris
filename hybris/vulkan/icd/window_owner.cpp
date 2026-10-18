@@ -53,8 +53,13 @@ static int present(void *data, present_job job, bool discard)
     // outside BOTH the game's submitting thread and the native pool mutex.
     int error = consume_fence(job.fence);
     ANativeWindow *window = owner->native;
-    if (!error) error = discard ? window->cancelBuffer(window, job.buffer, -1)
-                               : window->queueBuffer(window, job.buffer, -1);
+    if (!error) {
+        bool cancel = discard || owner->native->presentationStopped();
+        error = cancel ? window->cancelBuffer(window, job.buffer, -1)
+                       : window->queueBuffer(window, job.buffer, -1);
+        if (error == -ECANCELED && owner->native->presentationStopped())
+            error = window->cancelBuffer(window, job.buffer, -1);
+    }
     job.buffer->common.decRef(&job.buffer->common);
     return error;
 }
@@ -74,6 +79,7 @@ static const wl_registry_listener listener = {registry_global, registry_remove};
 void hybris_vk_wayland_window_destroy(hybris_vk_wayland_window *owner)
 {
     if (!owner) return;
+    if (owner->native) owner->native->stopPresentation();
     delete owner->presenter; // drain/join before destroying any native objects
     if (owner->native) {
         owner->native->destroyWlEGLWindow();
@@ -214,6 +220,7 @@ int hybris_vk_wayland_window_cancel(hybris_vk_wayland_window *owner,
 void hybris_vk_wayland_window_disconnect(hybris_vk_wayland_window *owner)
 {
     if (!owner || !owner->native) return;
+    owner->native->stopPresentation();
     owner->presenter->drain();
     owner->native->apiDisconnect(0);
 }
