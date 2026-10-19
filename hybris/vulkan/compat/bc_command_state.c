@@ -7,8 +7,20 @@
 struct hybris_bc_layout {
     VkPipelineLayout handle, clone;
     size_t references;
-    struct hybris_bc_layout *next;
+    struct hybris_bc_layout *next, *lookup_next;
 };
+
+/* The ownership list serves teardown; recording must not scan every live
+ * pipeline layout for each descriptor or push-constant write. Both structures
+ * are protected by layouts->guard and own the same stable layout lifetimes. */
+static size_t layout_bucket(VkPipelineLayout handle)
+{
+    uint64_t key = (uint64_t)handle;
+    key ^= key >> 33;
+    key *= UINT64_C(0xff51afd7ed558ccd);
+    key ^= key >> 33;
+    return (size_t)key & (HYBRIS_BC_LAYOUT_BUCKETS - 1);
+}
 enum saved_kind { SAVED_DESCRIPTORS, SAVED_PUSH };
 struct hybris_bc_saved_command {
     struct hybris_bc_saved_command *next;
@@ -57,6 +69,9 @@ VkResult hybris_bc_layout_add(struct hybris_bc_layouts *layouts, VkPipelineLayou
     pthread_mutex_lock(&layouts->guard);
     layout->next = layouts->head;
     layouts->head = layout;
+    size_t bucket = layout_bucket(handle);
+    layout->lookup_next = layouts->index[bucket];
+    layouts->index[bucket] = layout;
     pthread_mutex_unlock(&layouts->guard);
     return VK_SUCCESS;
 }
@@ -67,7 +82,12 @@ void hybris_bc_layout_remove(struct hybris_bc_layouts *layouts, VkPipelineLayout
     struct hybris_bc_layout **link = &layouts->head;
     while (*link && (*link)->handle != handle) link = &(*link)->next;
     struct hybris_bc_layout *layout = *link;
-    if (layout) *link = layout->next;
+    if (layout) {
+        *link = layout->next;
+        struct hybris_bc_layout **indexed = &layouts->index[layout_bucket(handle)];
+        while (*indexed && *indexed != layout) indexed = &(*indexed)->lookup_next;
+        if (*indexed) *indexed = layout->lookup_next;
+    }
     pthread_mutex_unlock(&layouts->guard);
     if (layout) hybris_bc_layout_release(layouts, layout);
 }
@@ -208,8 +228,8 @@ VkResult hybris_bc_layout_acquire(struct hybris_bc_layouts *layouts, VkPipelineL
 {
     *out = NULL;
     pthread_mutex_lock(&layouts->guard);
-    struct hybris_bc_layout *layout = layouts->head;
-    while (layout && layout->handle != handle) layout = layout->next;
+    struct hybris_bc_layout *layout = layouts->index[layout_bucket(handle)];
+    while (layout && layout->handle != handle) layout = layout->lookup_next;
     VkResult result = layout ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_INITIALIZATION_FAILED;
     if (layout && layout->references != SIZE_MAX) {
         ++layout->references; *out = layout; result = VK_SUCCESS;

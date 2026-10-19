@@ -6,12 +6,14 @@
 
 struct hybris_bc_layout;
 struct hybris_bc_saved_command;
+#define HYBRIS_BC_LAYOUT_BUCKETS 1024
 /* Owned by one emulated device; initialize before publishing that device. */
 struct hybris_bc_layouts {
     VkDevice device;
     PFN_vkGetDeviceProcAddr resolver;
     pthread_mutex_t guard;
     struct hybris_bc_layout *head;
+    struct hybris_bc_layout *index[HYBRIS_BC_LAYOUT_BUCKETS];
 };
 /* Owned by one command buffer, externally synchronized with its recording.
  * Reset/free only after Vulkan permits retiring the recorded commands. */
