@@ -1,5 +1,28 @@
 # Blender Vulkan diagnostics and bounded compatibility
 
+## Native ARM64 baseline and metadata lookup candidate (2026-10-19)
+
+Fresh X300 instance `yibu-e3c7423f`, Debug APK SHA-256
+`c3d23ef5ed11e02f474345be2e161e0ca1df5dbd141bd13182d5e0984ffcfa45`,
+used libhybris `39f9d13` and APT Blender 4.3.2+dfsg-2. The default OpenGL/Zink
+path displayed, saved and reopened the editable screwdriver. After selecting
+Blender's Vulkan backend and restarting through the product task launcher,
+the model displayed on Mali-G1-Ultra MC12. EEVEE NEXT at 1280x720 / 64 samples
+exported a recognizable PNG: first render 8.478 s, warm renders 1.843/1.890/2.458 s
+(median 1.890 s). No matching GPU-group or shadow-buffer errors were observed
+in this bounded session. This is not golden-image validation or a general
+Blender performance claim; all numbers include complete application rendering.
+
+A separate eight-render CPU-clock capture retained 6,301 samples, zero loss.
+Self samples were 23.89% in the compatibility layer, 13.74% in `flush_upload`
+and 4.59% in `hybris_memory_visibility_readback_range`. Both paths walked
+global lists for buffer/allocation lookup. The candidate indexes metadata by
+device and handle while retaining ownership lists for teardown, generation
+checks, allocator callbacks, mapped-range validation and actual cache calls.
+It does not remove the upload workaround. Candidate runtime acceptance and
+before/after timing remain pending. Evidence lives in the parent project's
+ignored `build/performance-x300/blender-*` artifacts.
+
 X300 / Mali-G1-Ultra, Blender 4.3.2, 2026-09-09. **Whole-application acceptance
 remains open.** The default scene, splash, text and toolbar now render, but
 repeated scene updates still produce Mali queue timeout messages. The large

@@ -20,7 +20,7 @@ struct allocation {
     VkMemoryPropertyFlags properties;
     VkAllocationCallbacks allocator;
     int custom_allocator, mapped;
-    struct allocation *next;
+    struct allocation *next, *lookup_next;
 };
 struct buffer {
     VkDevice device;
@@ -31,7 +31,7 @@ struct buffer {
     VkBufferUsageFlags usage;
     VkAllocationCallbacks allocator;
     int custom_allocator;
-    struct buffer *next;
+    struct buffer *next, *lookup_next;
 };
 static pthread_mutex_t guard = PTHREAD_MUTEX_INITIALIZER;
 /* Internal cache maintenance must also serialize with explicit application
@@ -40,16 +40,42 @@ static pthread_mutex_t cache_guard = PTHREAD_MUTEX_INITIALIZER;
 static struct allocation *allocations;
 static struct buffer *buffers;
 static uint64_t next_generation;
+/* Keep ownership lists for device retirement, but never walk all live Vulkan
+ * buffers/allocations for each draw, transfer or readback. Both indexes share
+ * guard with the metadata and retain the existing device-generation checks. */
+#define VISIBILITY_BUCKETS 4096
+static struct allocation *memory_index[VISIBILITY_BUCKETS];
+static struct buffer *buffer_index[VISIBILITY_BUCKETS];
+static size_t visibility_bucket(VkDevice device, uint64_t handle)
+{
+    uint64_t key = handle ^ (uint64_t)(uintptr_t)device;
+    key ^= key >> 33;
+    key *= UINT64_C(0xff51afd7ed558ccd);
+    key ^= key >> 33;
+    return (size_t)key & (VISIBILITY_BUCKETS - 1);
+}
+static void unindex_memory(struct allocation *allocation)
+{
+    struct allocation **link = &memory_index[visibility_bucket(allocation->device, (uint64_t)allocation->memory)];
+    while (*link && *link != allocation) link = &(*link)->lookup_next;
+    if (*link) *link = allocation->lookup_next;
+}
+static void unindex_buffer(struct buffer *buffer)
+{
+    struct buffer **link = &buffer_index[visibility_bucket(buffer->device, (uint64_t)buffer->handle)];
+    while (*link && *link != buffer) link = &(*link)->lookup_next;
+    if (*link) *link = buffer->lookup_next;
+}
 static struct allocation *find_memory(const struct hybris_layer_device *device, VkDeviceMemory memory)
 {
-    for (struct allocation *a = allocations; a; a = a->next)
+    for (struct allocation *a = memory_index[visibility_bucket(device->handle, (uint64_t)memory)]; a; a = a->lookup_next)
         if (a->device == device->handle && a->device_generation == device->generation && a->memory == memory)
             return a;
     return NULL;
 }
 static struct buffer *find_buffer(const struct hybris_layer_device *device, VkBuffer handle)
 {
-    for (struct buffer *b = buffers; b; b = b->next)
+    for (struct buffer *b = buffer_index[visibility_bucket(device->handle, (uint64_t)handle)]; b; b = b->lookup_next)
         if (b->device == device->handle && b->device_generation == device->generation && b->handle == handle)
             return b;
     return NULL;
@@ -167,6 +193,9 @@ static VkResult VKAPI_CALL allocate_memory(VkDevice handle, const VkMemoryAlloca
     pthread_mutex_lock(&guard);
     a->next = allocations;
     allocations = a;
+    size_t bucket = visibility_bucket(handle, (uint64_t)a->memory);
+    a->lookup_next = memory_index[bucket];
+    memory_index[bucket] = a;
     pthread_mutex_unlock(&guard);
     return result;
 }
@@ -175,7 +204,9 @@ static void VKAPI_CALL free_memory(VkDevice handle, VkDeviceMemory memory, const
     struct allocation *removed = NULL;
     pthread_mutex_lock(&guard);
     for (struct allocation **p = &allocations; *p; p = &(*p)->next)
-        if ((*p)->device == handle && (*p)->memory == memory) { removed = *p; *p = removed->next; break; }
+        if ((*p)->device == handle && (*p)->memory == memory) {
+            removed = *p; *p = removed->next; unindex_memory(removed); break;
+        }
     pthread_mutex_unlock(&guard);
     ((PFN_vkFreeMemory)hybris_layer_device_inner_proc(handle, "vkFreeMemory"))(handle, memory, allocator);
     if (removed) hybris_scaled_free(removed->custom_allocator ? &removed->allocator : NULL, removed);
@@ -222,6 +253,9 @@ static VkResult VKAPI_CALL create_buffer(VkDevice handle, const VkBufferCreateIn
     pthread_mutex_lock(&guard);
     b->next = buffers;
     buffers = b;
+    size_t bucket = visibility_bucket(handle, (uint64_t)b->handle);
+    b->lookup_next = buffer_index[bucket];
+    buffer_index[bucket] = b;
     pthread_mutex_unlock(&guard);
     return result;
 }
@@ -230,7 +264,9 @@ static void VKAPI_CALL destroy_buffer(VkDevice handle, VkBuffer buffer, const Vk
     struct buffer *removed = NULL;
     pthread_mutex_lock(&guard);
     for (struct buffer **p = &buffers; *p; p = &(*p)->next)
-        if ((*p)->device == handle && (*p)->handle == buffer) { removed = *p; *p = removed->next; break; }
+        if ((*p)->device == handle && (*p)->handle == buffer) {
+            removed = *p; *p = removed->next; unindex_buffer(removed); break;
+        }
     pthread_mutex_unlock(&guard);
     ((PFN_vkDestroyBuffer)hybris_layer_device_inner_proc(handle, "vkDestroyBuffer"))(handle, buffer, allocator);
     if (removed) hybris_scaled_free(removed->custom_allocator ? &removed->allocator : NULL, removed);
@@ -376,10 +412,16 @@ void hybris_memory_visibility_release_device(VkDevice device)
     struct buffer *blist = NULL;
     pthread_mutex_lock(&guard);
     for (struct allocation **p = &allocations; *p;)
-        if ((*p)->device == device) { struct allocation *a = *p; *p = a->next; a->next = alist; alist = a; }
+        if ((*p)->device == device) {
+            struct allocation *a = *p; *p = a->next;
+            unindex_memory(a); a->next = alist; alist = a;
+        }
         else p = &(*p)->next;
     for (struct buffer **p = &buffers; *p;)
-        if ((*p)->device == device) { struct buffer *b = *p; *p = b->next; b->next = blist; blist = b; }
+        if ((*p)->device == device) {
+            struct buffer *b = *p; *p = b->next;
+            unindex_buffer(b); b->next = blist; blist = b;
+        }
         else p = &(*p)->next;
     pthread_mutex_unlock(&guard);
     while (alist) { struct allocation *a = alist; alist = a->next; hybris_scaled_free(a->custom_allocator ? &a->allocator : NULL, a); }
