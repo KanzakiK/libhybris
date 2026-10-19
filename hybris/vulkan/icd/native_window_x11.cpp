@@ -44,7 +44,7 @@ struct Owner {
     uint32_t eid, serial, width, height;
     xcb_special_event_t *events;
     Buffer *pool[8];
-    unsigned count, pool_width, pool_height;
+    unsigned count, pool_width, pool_height, next_buffer;
     bool trace;
     unsigned trace_count;
     Pending *pending;
@@ -107,6 +107,7 @@ static void drain(Owner *o) {
 static void drop_pool(Owner *o) {
     for (unsigned i = 0; i < o->count; ++i) o->pool[i]->common.decRef(&o->pool[i]->common);
     o->count = 0;
+    o->next_buffer = 0;
 }
 static void disconnect(hybris_icd_window *base) {
     Owner *o = get(base); pthread_mutex_lock(&o->mutex);
@@ -153,8 +154,14 @@ static int dequeue(hybris_icd_window *base, int64_t timeout, ANativeWindowBuffer
         if (xcb_connection_has_error(o->connection)) { error = -EPIPE; break; }
         /* Configure events change the surface size, not the allocation or
          * release status of this pool. WSI reports SUBOPTIMAL to the caller. */
-        for (unsigned i = 0; i < o->count; ++i) {
+        /* Start after the previous acquisition rather than starving the rest
+         * of an idle pool. In Blender, repeatedly returning image zero also
+         * can stall its swapchain-indexed deferred resource pool retirement.
+         * Only choose released buffers; never wait for a preferred busy slot. */
+        for (unsigned step = 0; step < o->count; ++step) {
+            unsigned i = (o->next_buffer + step) % o->count;
             if (!o->pool[i]->held) {
+                o->next_buffer = (i + 1) % o->count;
                 o->pool[i]->held = true; *buffer = o->pool[i];
                 pthread_mutex_unlock(&o->mutex); return 0;
             }
