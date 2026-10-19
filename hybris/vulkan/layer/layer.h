@@ -42,6 +42,8 @@ struct hybris_layer_device {
     int track_commands;
     const struct hybris_layer_command_dispatch *recording;
     uint64_t instance_generation;
+    /* Set only in command_device's returned copy, never in device state. */
+    uint64_t recording_epoch;
 };
 int hybris_layer_lookup_physical(VkPhysicalDevice physical, struct hybris_layer_physical *out);
 int hybris_layer_lookup_device(VkDevice device, struct hybris_layer_device *out);

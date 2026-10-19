@@ -26,6 +26,7 @@ struct command_state {
     VkCommandPool pool;
     VkDevice device;
     uint64_t generation;
+    uint64_t upload_epoch;
     VkResult error;
     VkAllocationCallbacks allocator;
     int custom_allocator;
@@ -52,6 +53,7 @@ struct pool_state {
 };
 static pthread_mutex_t guard = PTHREAD_MUTEX_INITIALIZER;
 static struct command_state *commands;
+static uint64_t next_upload_epoch;
 static struct pool_state *pools;
 #define COMMAND_BUCKETS 1024
 static struct command_state *command_index[COMMAND_BUCKETS];
@@ -99,6 +101,7 @@ static void reset_resources(VkCommandBuffer command)
     pthread_mutex_lock(&guard);
     for (struct command_state *state = commands; state; state = state->next)
         if (state->handle == command) {
+            state->upload_epoch = next_upload_epoch == UINT64_MAX ? 0 : ++next_upload_epoch;
             list = state->resources; state->resources = NULL;
             rendering=state->rendering;memset(&state->rendering,0,sizeof(state->rendering));
             memset(state->vertices,0,sizeof(state->vertices));state->index=VK_NULL_HANDLE;
@@ -146,12 +149,14 @@ static VkResult VKAPI_CALL create_pool(VkDevice handle, const VkCommandPoolCreat
 int hybris_layer_command_device(VkCommandBuffer command, struct hybris_layer_device *device)
 {
     VkDevice owner = VK_NULL_HANDLE;
-    uint64_t generation = 0;
+    uint64_t generation = 0, epoch = 0;
     pthread_mutex_lock(&guard);
     const struct command_state *state = find_command_locked(command);
-    if (state) { owner = state->device; generation = state->generation; }
+    if (state) { owner = state->device; generation = state->generation; epoch = state->upload_epoch; }
     pthread_mutex_unlock(&guard);
-    return owner && hybris_layer_lookup_device(owner, device) && device->generation == generation;
+    if (!owner || !hybris_layer_lookup_device(owner, device) || device->generation != generation) return 0;
+    device->recording_epoch = epoch;
+    return 1;
 }
 int hybris_layer_command_allocator(VkCommandBuffer command, VkAllocationCallbacks *allocator)
 {

@@ -1,5 +1,35 @@
 # Blender Vulkan diagnostics and bounded compatibility
 
+## Recording-path optimization candidate (2026-10-19)
+
+Fresh X300 instance `yibu-201c27ec`, native APT Blender 4.3.2, reproduced two
+costs in the upload-enabled runtime. Of 141 self samples in `save`, 140 land
+in its inlined pipeline-layout linked-list walk (ELF offsets 0x95fc–0x960c).
+The layout candidate replaces only this lookup with a per-device 1,024-bucket
+index, retaining the ownership list, locking, clone references and teardown.
+
+Blender's built-in DRAW_WIN workload (no swap) took 3.283/3.369/3.278 seconds
+for three batches of 100 redraws of the saved screwdriver, window 2358x1216.
+Warm redraw-only CPU sampling places about 40% of self samples in the vendor's
+`dc cvac` loop. The exact vendor ELF SHA-256 is
+`b63850b4de5b5e2982b6235e2f9ab6af22273101526a31b771223a718e3c38bf`.
+Low-frequency raw register/stack capture found 198 samples in that loop; 188
+clean 4 MiB and retain the layer's `flush_upload` driver-call return address
+(layer offset 0x10cac). Normal FP/DWARF unwinding stops at this vendor leaf;
+the raw registers and stack are retained instead of inventing a caller name.
+
+The second candidate keeps the required initial immediate-vertex flush but
+coalesces repeated bindings of that same buffer within one command recording.
+This relies on the existing bounded Blender policy: host writes precede
+recording and remain immutable until GPU retirement. It is not a generic
+Vulkan coherent-memory mechanism. Texture and indirect uploads are unchanged.
+Successful begin/reset assigns a fresh recording epoch. Allocation/buffer
+lifetimes, rebind, map/unmap and explicit flush/invalidate invalidate reuse;
+mapping bounds and atom alignment are still checked. Only a successful driver
+flush publishes reuse after rechecking lifetime/revision metadata. Counter
+saturation disables reuse. No queue wait, worker, dirty-page tracker or global
+application cache is introduced. Fresh candidate acceptance remains pending.
+
 ## Upload-disabled diagnostic candidate (2026-10-19)
 
 Diagnostic commit `fddd8fb` clears only `HYBRIS_APP_HOST_UPLOAD_FLUSH` from the matched

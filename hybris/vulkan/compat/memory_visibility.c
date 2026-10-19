@@ -14,7 +14,7 @@
  * are host-written and immutable until their GPU consumers have retired. */
 struct allocation {
     VkDevice device;
-    uint64_t device_generation, generation;
+    uint64_t device_generation, generation, upload_revision;
     VkDeviceMemory memory;
     VkDeviceSize size, atom, map_offset, map_size;
     VkMemoryPropertyFlags properties;
@@ -25,6 +25,7 @@ struct allocation {
 struct buffer {
     VkDevice device;
     uint64_t device_generation, memory_generation;
+    uint64_t generation, vertex_upload_epoch, vertex_upload_revision;
     VkBuffer handle;
     VkDeviceMemory memory;
     VkDeviceSize size, offset;
@@ -107,10 +108,33 @@ static VkResult cache_memory(VkDevice device, uint32_t count,
     pthread_mutex_unlock(&cache_guard);
     return result;
 }
+static void changed_upload_mapping(struct allocation *allocation)
+{
+    /* Saturation disables reuse rather than aliasing an old revision. */
+    if (allocation->upload_revision != UINT64_MAX) ++allocation->upload_revision;
+}
+static void explicit_cache_change(VkDevice handle, uint32_t count, const VkMappedMemoryRange *ranges)
+{
+    struct hybris_layer_device device;
+    if (!hybris_layer_lookup_device(handle, &device)) return;
+    if (!(device.application_policy & HYBRIS_APP_HOST_UPLOAD_FLUSH)) return;
+    pthread_mutex_lock(&guard);
+    for (uint32_t i = 0; i < count; ++i) {
+        struct allocation *allocation = find_memory(&device, ranges[i].memory);
+        if (allocation) changed_upload_mapping(allocation);
+    }
+    pthread_mutex_unlock(&guard);
+}
 static VkResult VKAPI_CALL flush_memory(VkDevice device, uint32_t count, const VkMappedMemoryRange *ranges)
-{ return cache_memory(device, count, ranges, "vkFlushMappedMemoryRanges"); }
+{
+    explicit_cache_change(device, count, ranges);
+    return cache_memory(device, count, ranges, "vkFlushMappedMemoryRanges");
+}
 static VkResult VKAPI_CALL invalidate_memory(VkDevice device, uint32_t count, const VkMappedMemoryRange *ranges)
-{ return cache_memory(device, count, ranges, "vkInvalidateMappedMemoryRanges"); }
+{
+    explicit_cache_change(device, count, ranges);
+    return cache_memory(device, count, ranges, "vkInvalidateMappedMemoryRanges");
+}
 VkResult hybris_memory_visibility_readback_range(const struct hybris_layer_device *device,
     VkBuffer buffer, VkDeviceSize offset, VkDeviceSize size, struct hybris_readback_range *range)
 {
@@ -220,7 +244,10 @@ static VkResult VKAPI_CALL map_memory(VkDevice handle, VkDeviceMemory memory, Vk
     if (result == VK_SUCCESS && hybris_layer_lookup_device(handle, &device)) {
         pthread_mutex_lock(&guard);
         struct allocation *a = find_memory(&device, memory);
-        if (a) { a->mapped = 1; a->map_offset = offset; a->map_size = size == VK_WHOLE_SIZE ? a->size - offset : size; }
+        if (a) {
+            changed_upload_mapping(a);
+            a->mapped = 1; a->map_offset = offset; a->map_size = size == VK_WHOLE_SIZE ? a->size - offset : size;
+        }
         pthread_mutex_unlock(&guard);
     }
     return result;
@@ -231,7 +258,7 @@ static void VKAPI_CALL unmap_memory(VkDevice handle, VkDeviceMemory memory)
     if (hybris_layer_lookup_device(handle, &device)) {
         pthread_mutex_lock(&guard);
         struct allocation *a = find_memory(&device, memory);
-        if (a) a->mapped = 0;
+        if (a) { changed_upload_mapping(a); a->mapped = 0; }
         pthread_mutex_unlock(&guard);
     }
     ((PFN_vkUnmapMemory)hybris_layer_device_inner_proc(handle, "vkUnmapMemory"))(handle, memory);
@@ -246,6 +273,14 @@ static VkResult VKAPI_CALL create_buffer(VkDevice handle, const VkBufferCreateIn
     *b = (struct buffer){.device = handle, .device_generation = device.generation,
         .size = info->size, .usage = info->usage, .custom_allocator = allocator != NULL};
     if (allocator) b->allocator = *allocator;
+    pthread_mutex_lock(&guard);
+    if (next_generation == UINT64_MAX) {
+        pthread_mutex_unlock(&guard);
+        hybris_scaled_free(allocator, b);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    b->generation = ++next_generation;
+    pthread_mutex_unlock(&guard);
     VkResult result = ((PFN_vkCreateBuffer)hybris_layer_device_inner_proc(handle,
         "vkCreateBuffer"))(handle, info, allocator, out);
     if (result != VK_SUCCESS) { hybris_scaled_free(allocator, b); return result; }
@@ -278,7 +313,10 @@ static void bound(VkDevice handle, VkBuffer buffer, VkDeviceMemory memory, VkDev
     pthread_mutex_lock(&guard);
     struct allocation *a = find_memory(&device, memory);
     struct buffer *b = find_buffer(&device, buffer);
-    if (b) { b->memory = memory; b->offset = offset; b->memory_generation = a ? a->generation : 0; }
+    if (b) {
+        b->vertex_upload_epoch = 0;
+        b->memory = memory; b->offset = offset; b->memory_generation = a ? a->generation : 0;
+    }
     pthread_mutex_unlock(&guard);
 }
 static VkResult VKAPI_CALL bind_buffer(VkDevice handle, VkBuffer buffer, VkDeviceMemory memory, VkDeviceSize offset)
@@ -303,6 +341,13 @@ static VkResult VKAPI_CALL bind_khr(VkDevice d, uint32_t n, const VkBindBufferMe
 static void flush_upload(VkCommandBuffer command, const struct hybris_layer_device *device, VkBuffer source, int upload_kind)
 {
     if (!(device->application_policy & HYBRIS_APP_HOST_UPLOAD_FLUSH)) return;
+    /* The existing Blender immediate-upload policy requires host writes to
+     * precede recording and remain immutable until GPU retirement. Repeated
+     * bindings in that recording do not make the same 4 MiB buffer dirty again.
+     * Do not apply this reuse to texture or indirect uploads. */
+    uint64_t epoch = upload_kind == 1 ? device->recording_epoch : 0;
+    uint64_t buffer_generation = 0, memory_generation = 0, revision = 0;
+    VkDeviceSize buffer_offset = 0;
     VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};
     VkResult result = VK_SUCCESS;
     pthread_mutex_lock(&guard);
@@ -329,13 +374,32 @@ static void flush_upload(VkCommandBuffer command, const struct hybris_layer_devi
             end += padding < a->size - end ? padding : a->size - end;
             if (begin < a->map_offset || end > a->map_offset + a->map_size)
                 result = VK_ERROR_MEMORY_MAP_FAILED;
-            else { range.memory = a->memory; range.offset = begin; range.size = end - begin; }
+            else if (!(epoch && a->upload_revision != UINT64_MAX &&
+                       b->vertex_upload_epoch == epoch &&
+                       b->vertex_upload_revision == a->upload_revision)) {
+                range.memory = a->memory; range.offset = begin; range.size = end - begin;
+                buffer_generation = b->generation; memory_generation = a->generation;
+                revision = a->upload_revision; buffer_offset = b->offset;
+            }
         }
     }
     pthread_mutex_unlock(&guard);
     /* Never invoke driver code or application allocation callbacks under guard. */
-    if (range.memory)
-        result = flush_memory(device->handle, 1, &range);
+    if (range.memory) {
+        result = cache_memory(device->handle, 1, &range, "vkFlushMappedMemoryRanges");
+        if (result == VK_SUCCESS && epoch) {
+            pthread_mutex_lock(&guard);
+            b = find_buffer(device, source);
+            a = find_memory(device, range.memory);
+            if (b && a && b->generation == buffer_generation && b->memory == range.memory &&
+                b->offset == buffer_offset && b->memory_generation == memory_generation &&
+                a->generation == memory_generation && a->upload_revision == revision && a->mapped) {
+                b->vertex_upload_epoch = epoch;
+                b->vertex_upload_revision = revision;
+            }
+            pthread_mutex_unlock(&guard);
+        }
+    }
     if (result != VK_SUCCESS) hybris_layer_command_error(command, result);
 }
 static void VKAPI_CALL bind_vertices(VkCommandBuffer command, uint32_t first, uint32_t count,
