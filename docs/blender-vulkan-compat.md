@@ -1,5 +1,17 @@
 # Blender Vulkan diagnostics and bounded compatibility
 
+## Upload-disabled diagnostic candidate (2026-10-19)
+
+This candidate clears only `HYBRIS_APP_HOST_UPLOAD_FLUSH` from the matched
+Blender policy. Rendering-segment lowering, readback invalidation, metadata
+indexes and command wrappers are unchanged. It is an experiment, not a claim
+that noncoherent host writes are automatically visible. Compare a freshly
+installed Blender's startup text/toolbars, model edits, saved/reopened scene
+and EEVEE pixels with the upload-enabled `5591a85` control before promotion.
+The earlier missing-flush captures and visible texture/immediate-upload fixes
+below are positive evidence, but do not establish necessity on today's complete
+runtime. Acceptance and matched timings for this candidate remain pending.
+
 ## Native ARM64 baseline and metadata lookup candidate (2026-10-19)
 
 Fresh X300 instance `yibu-e3c7423f`, Debug APK SHA-256
