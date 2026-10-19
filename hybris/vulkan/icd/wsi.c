@@ -24,6 +24,7 @@
 #ifdef WANT_WAYLAND
 static const VkExtensionProperties local_wsi[] = {
     {VK_KHR_SURFACE_EXTENSION_NAME, VK_KHR_SURFACE_SPEC_VERSION},
+    {VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME, VK_EXT_HEADLESS_SURFACE_SPEC_VERSION},
     {VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME, VK_KHR_WAYLAND_SURFACE_SPEC_VERSION},
 #ifdef WANT_X11
     {VK_KHR_XCB_SURFACE_EXTENSION_NAME, VK_KHR_XCB_SURFACE_SPEC_VERSION},
@@ -40,6 +41,7 @@ struct surface_state {
     struct wl_display *display;
     VkAllocationCallbacks allocator;
     int custom_allocator;
+    int headless;
     struct surface_state *next;
 };
 
@@ -159,6 +161,10 @@ VkResult hybris_icd_wsi_prepare_instance(const VkInstanceCreateInfo *info,
             *platforms_enabled |= HYBRIS_ICD_WSI_WAYLAND;
             continue;
         }
+        if (!strcmp(name, VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME)) {
+            *platforms_enabled |= HYBRIS_ICD_WSI_HEADLESS;
+            continue;
+        }
 #ifdef WANT_X11
         if (!strcmp(name, VK_KHR_XCB_SURFACE_EXTENSION_NAME)) {
             *platforms_enabled |= HYBRIS_ICD_WSI_XCB; continue;
@@ -189,6 +195,38 @@ static VkResult destroy_owned(struct surface_state *state)
     if (!state) return VK_SUCCESS;
     state->window->ops->destroy(state->window);
     surface_free(state);
+    return VK_SUCCESS;
+}
+
+static VkResult VKAPI_CALL create_headless_surface(VkInstance instance,
+    const VkHeadlessSurfaceCreateInfoEXT *info,
+    const VkAllocationCallbacks *allocator, VkSurfaceKHR *surface)
+{
+    int enabled = 0;
+    uint64_t generation = 0;
+    if (!info || !surface || info->sType != VK_STRUCTURE_TYPE_HEADLESS_SURFACE_CREATE_INFO_EXT || info->flags)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    if (!hybris_icd_lookup_instance_wsi(instance, NULL, &enabled, &generation) ||
+        !(enabled & HYBRIS_ICD_WSI_HEADLESS)) return VK_ERROR_EXTENSION_NOT_PRESENT;
+    pthread_once(&gralloc_once, initialize_gralloc);
+    struct surface_state *state = surface_alloc(allocator, sizeof(*state));
+    if (!state) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    memset(state, 0, sizeof(*state));
+    state->custom_allocator = allocator != NULL;
+    if (allocator) state->allocator = *allocator;
+    int error = hybris_icd_window_headless(&state->window);
+    if (error) {
+        surface_free(state);
+        return error == -ENOMEM ? VK_ERROR_OUT_OF_HOST_MEMORY : VK_ERROR_INITIALIZATION_FAILED;
+    }
+    state->instance = instance;
+    state->generation = generation;
+    state->headless = 1;
+    pthread_mutex_lock(&surface_guard);
+    state->next = surfaces;
+    surfaces = state;
+    pthread_mutex_unlock(&surface_guard);
+    *surface = (VkSurfaceKHR)(uintptr_t)state;
     return VK_SUCCESS;
 }
 
@@ -342,6 +380,12 @@ struct hybris_icd_window *hybris_icd_wsi_surface_window(VkSurfaceKHR surface,
     if (instance) *instance = state->instance;
     if (generation) *generation = state->generation;
     return state->window;
+}
+
+int hybris_icd_wsi_surface_headless(VkSurfaceKHR surface)
+{
+    struct surface_state *state = find_surface(surface);
+    return state && state->headless;
 }
 
 static uint32_t surface_formats(const struct hybris_icd_physical *context,
@@ -540,8 +584,9 @@ static VkResult VKAPI_CALL get_surface_present_modes(VkPhysicalDevice physical,
         return VK_ERROR_SURFACE_LOST_KHR;
     if (!hybris_icd_physical_has_native_buffer(physical))
         return VK_ERROR_UNKNOWN;
-    const VkPresentModeKHR fifo = VK_PRESENT_MODE_FIFO_KHR;
-    return fill_array(1, count, modes, &fifo, sizeof(fifo));
+    const VkPresentModeKHR supported[] = {VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_IMMEDIATE_KHR};
+    return fill_array(hybris_icd_wsi_surface_headless(surface) ? 2 : 1,
+        count, modes, supported, sizeof(*supported));
 }
 
 void hybris_icd_wsi_release_instance(VkInstance instance)
@@ -567,6 +612,11 @@ void hybris_icd_wsi_release_instance(VkInstance instance)
     }
 }
 #else
+int hybris_icd_wsi_surface_headless(VkSurfaceKHR surface)
+{
+    (void)surface;
+    return 0;
+}
 void hybris_icd_wsi_release_instance(VkInstance instance)
 {
     (void)instance;
@@ -596,6 +646,8 @@ PFN_vkVoidFunction hybris_icd_wsi_proc(const char *name, int surface_enabled,
     int platforms_enabled)
 {
 #ifdef WANT_WAYLAND
+    if ((platforms_enabled & HYBRIS_ICD_WSI_HEADLESS) && !strcmp(name, "vkCreateHeadlessSurfaceEXT"))
+        return (PFN_vkVoidFunction)create_headless_surface;
     if (!strcmp(name, "vkGetPhysicalDevicePresentRectanglesKHR"))
         return (PFN_vkVoidFunction)present_rectangles;
     if (platforms_enabled & HYBRIS_ICD_WSI_WAYLAND) {

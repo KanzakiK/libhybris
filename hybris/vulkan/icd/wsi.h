@@ -5,7 +5,8 @@
 #include "hwvulkan.h"
 
 struct hybris_icd_window;
-enum { HYBRIS_ICD_WSI_WAYLAND = 1, HYBRIS_ICD_WSI_XCB = 2, HYBRIS_ICD_WSI_XLIB = 4 };
+enum { HYBRIS_ICD_WSI_WAYLAND = 1, HYBRIS_ICD_WSI_XCB = 2, HYBRIS_ICD_WSI_XLIB = 4,
+       HYBRIS_ICD_WSI_HEADLESS = 8 };
 
 struct hybris_icd_physical {
     VkInstance instance;
@@ -32,6 +33,7 @@ VkResult hybris_icd_wsi_capabilities(VkPhysicalDevice physical,
     VkSurfaceKHR surface, VkSurfaceCapabilitiesKHR *capabilities);
 int hybris_icd_physical_has_native_buffer(VkPhysicalDevice physical);
 int hybris_icd_wsi_graphics_family(VkPhysicalDevice physical, uint32_t index);
+int hybris_icd_wsi_surface_headless(VkSurfaceKHR surface);
 struct hybris_icd_window *hybris_icd_wsi_surface_window(VkSurfaceKHR surface,
     VkInstance *instance, uint64_t *generation);
 

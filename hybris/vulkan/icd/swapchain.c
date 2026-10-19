@@ -210,7 +210,8 @@ static VkResult VKAPI_CALL create_swapchain(VkDevice device,
     pthread_mutex_unlock(&swapchain_guard);
     if (in_use) return VK_ERROR_NATIVE_WINDOW_IN_USE_KHR;
     if (info->flags || info->imageArrayLayers != 1 ||
-        info->presentMode != VK_PRESENT_MODE_FIFO_KHR ||
+        (info->presentMode != VK_PRESENT_MODE_FIFO_KHR &&
+         !(hybris_icd_wsi_surface_headless(info->surface) && info->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR)) ||
         info->preTransform != VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR ||
         info->imageColorSpace != VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
         return VK_ERROR_INITIALIZATION_FAILED;

@@ -22,6 +22,7 @@ struct hybris_icd_window { const struct hybris_icd_window_ops *ops; };
 extern "C" {
 #endif
 int hybris_icd_window_wayland(struct wl_display *, struct wl_surface *, struct hybris_icd_window **);
+int hybris_icd_window_headless(struct hybris_icd_window **);
 int hybris_icd_window_xcb(struct xcb_connection_t *, uint32_t, struct hybris_icd_window **);
 int hybris_icd_xcb_supported(struct xcb_connection_t *, uint32_t visual);
 #ifdef __cplusplus
