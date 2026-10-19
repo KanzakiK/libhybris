@@ -25,9 +25,7 @@ unsigned hybris_application_policy(const VkApplicationInfo *app)
         app->applicationVersion != VK_MAKE_VERSION(1, 0, 0) ||
         app->engineVersion != VK_MAKE_VERSION(1, 0, 0) || app->apiVersion != VK_API_VERSION_1_2)
         return 0;
-    /* Diagnostic candidate: isolate upload cache maintenance from the retained
-     * rendering/readback corrections. Not validated for production promotion. */
-    return HYBRIS_APP_RENDERING_SEGMENTS |
+    return HYBRIS_APP_HOST_UPLOAD_FLUSH | HYBRIS_APP_RENDERING_SEGMENTS |
         HYBRIS_APP_HOST_READBACK_INVALIDATE;
 }
 

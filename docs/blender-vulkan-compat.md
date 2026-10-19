@@ -2,7 +2,7 @@
 
 ## Upload-disabled diagnostic candidate (2026-10-19)
 
-This candidate clears only `HYBRIS_APP_HOST_UPLOAD_FLUSH` from the matched
+Diagnostic commit `fddd8fb` clears only `HYBRIS_APP_HOST_UPLOAD_FLUSH` from the matched
 Blender policy. Rendering-segment lowering, readback invalidation, metadata
 indexes and command wrappers are unchanged. It is an experiment, not a claim
 that noncoherent host writes are automatically visible. Compare a freshly
@@ -10,7 +10,23 @@ installed Blender's startup text/toolbars, model edits, saved/reopened scene
 and EEVEE pixels with the upload-enabled `5591a85` control before promotion.
 The earlier missing-flush captures and visible texture/immediate-upload fixes
 below are positive evidence, but do not establish necessity on today's complete
-runtime. Acceptance and matched timings for this candidate remain pending.
+runtime. Fresh X300 instance `yibu-41ebbff8` now reproduces broken splash
+texture uploads (black horizontal streaks) and missing toolbar icons immediately
+after selecting Vulkan and launching Blender 4.3.2. The log confirms policy
+`0x6`; the upload-enabled `5591a85` control uses `0x7` and displays both correctly.
+Both use Blender SHA-256
+`4b8538be4e595b6150bf4a205c5b74b77e174c3a26d6f96cac7f326ca28899d7`
+and ICD SHA-256
+`a62a4405cdbff3eb72e79c51567b1f49abbd3ca43f5e7d38ecfc10221959abe6`.
+The diagnostic APK SHA-256 is
+`9dbf49ae91c70b53289dffdb30b83e56cb952e4ddb3a9cd29cd17b615e272995`;
+the installed base APK matches. Active layer SHA-256 is
+`6d7b77721c8c3b06a89de20cc2964e34a348edf29075f78b76255fc893152764`.
+The new screenshot `build/performance-x300/blender-no-upload-vulkan.png` in
+the parent workspace retains the failure. This demonstrates that removing
+the complete upload policy is incorrect on today's tested runtime; it does
+not independently establish the necessity of each texture/vertex/indirect hook.
+Restore the upload policy; this failed diagnostic is not a production candidate.
 
 ## Native ARM64 baseline and metadata lookup candidate (2026-10-19)
 
