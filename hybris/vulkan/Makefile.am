@@ -3,7 +3,8 @@ if HAS_VULKAN_HEADERS
 lib_LTLIBRARIES = \
 	libvulkan.la \
 	libhybris-vulkan-icd.la \
-	libVkLayer_hybris_compat.la
+	libVkLayer_hybris_compat.la \
+	libVkLayer_arlinux_null_descriptor.la
 
 # Explicit loader layer, independent of Android linker/HAL/WSI libraries.
 # Its manifest is colocated with the DSO; opt in using VK_LAYER_PATH.
@@ -36,7 +37,16 @@ libVkLayer_hybris_compat_la_CFLAGS = -fvisibility=hidden
 # loader unloading its last instance. All per-instance/device state is freed.
 libVkLayer_hybris_compat_la_LDFLAGS = -module -avoid-version -no-undefined -pthread -Wl,-z,nodelete
 layerdir = $(libdir)
-layer_DATA = layer/VkLayer_hybris_compat.json
+layer_DATA = layer/VkLayer_hybris_compat.json \
+	layer_null_descriptor/VkLayer_arlinux_null_desc.json
+
+# Explicit compatibility layer for Mali drivers that do not expose
+# VK_EXT_robustness2.nullDescriptor but must run Mesa Zink.
+libVkLayer_arlinux_null_descriptor_la_SOURCES = \
+	layer_null_descriptor/arlinux_null_descriptor.c
+libVkLayer_arlinux_null_descriptor_la_CFLAGS = -fvisibility=hidden
+libVkLayer_arlinux_null_descriptor_la_LDFLAGS = \
+	-module -avoid-version -no-undefined -pthread -Wl,-z,nodelete
 
 libvulkan_la_SOURCES = \
 	vulkan.c \
@@ -69,7 +79,7 @@ libvulkan_la_LDFLAGS = \
 
 # Optional standard-loader backend; no default ICD JSON is installed.
 libhybris_vulkan_icd_la_SOURCES = icd/icd.c icd/instance.c icd/instance.h icd/device.c icd/device.h icd/wsi.c icd/wsi.h icd/swapchain.c icd/swapchain.h icd/vk_android_native_buffer.h icd/hwvulkan.h icd/physical_commands.inc
-EXTRA_DIST = compat/shaders/bc7.glsl compat/shaders/bc6h.glsl compat/shaders/LICENSE.bcdec icd/README.md compat/shaders/bc_decode.comp compat/shaders/generate-bc.py compat/shaders/polygon_indices.comp compat/shaders/generate-polygon.py layer/VkLayer_hybris_compat.json
+EXTRA_DIST = compat/shaders/bc7.glsl compat/shaders/bc6h.glsl compat/shaders/LICENSE.bcdec icd/README.md compat/shaders/bc_decode.comp compat/shaders/generate-bc.py compat/shaders/polygon_indices.comp compat/shaders/generate-polygon.py layer/VkLayer_hybris_compat.json layer_null_descriptor/VkLayer_arlinux_null_desc.json
 libhybris_vulkan_icd_la_CFLAGS = $(libvulkan_la_CFLAGS) -fvisibility=hidden
 libhybris_vulkan_icd_la_CXXFLAGS = $(libvulkan_la_CXXFLAGS) -fvisibility=hidden
 libhybris_vulkan_icd_la_LDFLAGS = \

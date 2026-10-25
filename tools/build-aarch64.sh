@@ -206,6 +206,7 @@ for lib in \
     libvulkan.so.1.2.183 \
     libhybris-vulkan-icd.so.0 \
     libVkLayer_hybris_compat.so \
+    libVkLayer_arlinux_null_descriptor.so \
     libhybris/eglplatform_null.so \
     libhybris/linker/q.so
 do
@@ -215,6 +216,17 @@ if [[ -n "$MISSING" ]]; then
     echo "ERROR: missing built libraries:$MISSING" >&2
     exit 1
 fi
+for symbol in vkGetInstanceProcAddr vkGetDeviceProcAddr; do
+    if ! readelf -Ws "$LIB_DIR/libVkLayer_arlinux_null_descriptor.so" |
+         grep -q " $symbol$"; then
+        echo "ERROR: nullDescriptor layer is missing $symbol" >&2
+        exit 1
+    fi
+done
+[[ -f "$LIB_DIR/VkLayer_arlinux_null_desc.json" ]] || {
+    echo "ERROR: nullDescriptor layer manifest was not installed" >&2
+    exit 1
+}
 if ! readelf -d "$LIB_DIR/libhybris-platformcommon.so.1.0.0" | grep -q 'libwayland-client.so.0'; then
     echo "ERROR: libhybris-platformcommon.so is missing DT_NEEDED libwayland-client.so.0" >&2
     readelf -d "$LIB_DIR/libhybris-platformcommon.so.1.0.0" >&2
