@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
+#include <stdio.h>
 
 static pthread_once_t policy_once = PTHREAD_ONCE_INIT;
 static int policy;
@@ -356,6 +357,17 @@ static int image_supported(VkFormat format, VkImageType type, VkImageTiling tili
                     VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT)) &&
         (!(flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) || hybris_bc_mutable_format(format));
 }
+static void trace_image_query(VkFormat format, VkImageType type, VkImageTiling tiling,
+    VkImageUsageFlags usage, VkImageCreateFlags flags, const void *chain)
+{
+    const char *trace = getauxval(AT_SECURE) ? NULL : getenv("HYBRIS_VULKAN_TRACE");
+    if (!trace || strcmp(trace, "1")) return;
+    fprintf(stderr, "HYBRIS_BC_QUERY format=%u type=%u tiling=%u usage=0x%x flags=0x%x",
+        format, type, tiling, usage, flags);
+    for (const VkBaseInStructure *node = chain; node; node = node->pNext)
+        fprintf(stderr, " next=%u", node->sType);
+    fprintf(stderr, "\n");
+}
 static VkResult VKAPI_CALL image_properties(VkPhysicalDevice physical, VkFormat format, VkImageType type,
     VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, VkImageFormatProperties *out)
 {
@@ -363,6 +375,7 @@ static VkResult VKAPI_CALL image_properties(VkPhysicalDevice physical, VkFormat 
     if (!hybris_layer_lookup_physical(physical, &context)) return VK_ERROR_INITIALIZATION_FAILED;
     PHYSICAL_PROC(GetPhysicalDeviceImageFormatProperties);
     if (emulates(physical, format)) {
+        trace_image_query(format, type, tiling, usage, flags, NULL);
         if (!image_supported(format, type, tiling, usage, flags)) { *out = (VkImageFormatProperties){0}; return VK_ERROR_FORMAT_NOT_SUPPORTED; }
         VkResult result = GetPhysicalDeviceImageFormatProperties(physical, hybris_bc_image_format(format,
             (flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ? 0 : physical_rgb_mask(physical)), type,
@@ -380,6 +393,7 @@ static VkResult image_properties2(VkPhysicalDevice physical, const VkPhysicalDev
     PFN_vkGetPhysicalDeviceImageFormatProperties2 query =
         (PFN_vkGetPhysicalDeviceImageFormatProperties2)context.resolver(context.instance, name);
     if (!emulates(physical, info->format)) return query(physical, info, out);
+    trace_image_query(info->format, info->type, info->tiling, info->usage, info->flags, info->pNext);
     out->imageFormatProperties = (VkImageFormatProperties){0};
     if (!image_supported(info->format, info->type, info->tiling, info->usage, info->flags)) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     for (const VkBaseInStructure *node = info->pNext; node; node = node->pNext) {
