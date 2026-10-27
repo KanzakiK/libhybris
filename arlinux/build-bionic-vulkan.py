@@ -108,7 +108,7 @@ int bionic_hw_get_module(const char*, const hw_module_t**);
     protocol = output / 'wayland-android-protocol.c'
     subprocess.run(['wayland-scanner', 'private-code', str(xml), str(protocol)], check=True)
     files = [stage / 'vulkan/icd' / name for name in ['icd.c', 'instance.c', 'device.c', 'wsi.c', 'swapchain.c',
-             'native_window_wayland.c', 'window_owner.cpp', 'wayland_window.cpp']]
+             'native_window_wayland.c', 'native_window_headless.cpp', 'window_owner.cpp', 'wayland_window.cpp']]
     files += [stage / 'platforms/common/nativewindowbase.cpp', stage / 'platforms/wayland/wayland_window_common.cpp',
               component / 'bionic-vulkan/native.cpp', protocol]
     # Use the AOSP usage conversion already shipped with the shared adapter.

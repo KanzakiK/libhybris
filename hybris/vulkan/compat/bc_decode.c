@@ -12,7 +12,8 @@ struct kernel { const uint32_t *code; size_t size; };
 #define K(name) {hybris_bc_##name##_spv, sizeof(hybris_bc_##name##_spv)}
 static const struct kernel kernels[] = {
     K(bc1), K(bc2), K(bc3), K(bc4), K(bc5), K(bc6h), K(bc7),
-    K(rgb8), K(rgb16), K(tx_bc1), K(tx_bc2), K(tx_bc3), K(tx_bc4), K(tx_bc5), K(tx_bc7)
+    K(rgb8), K(rgb16), K(tx_bc1), K(tx_bc2), K(tx_bc3), K(tx_bc4), K(tx_bc5), K(tx_bc7),
+    K(tx_bc1_fast), K(tx_bc2_fast), K(tx_bc3_fast), K(tx_bc4_fast), K(tx_bc5_fast), K(tx_bc7_fast)
 };
 #undef K
 static int family(VkFormat f)
@@ -50,7 +51,8 @@ void hybris_bc_decoder_destroy(struct hybris_bc_decoder *d, const VkAllocationCa
     if (!d || !d->device) return;
     PROC(DestroyPipeline); PROC(DestroyPipelineLayout); PROC(DestroyDescriptorSetLayout);
     a = d->custom_allocator ? &d->allocator : NULL;
-    for (unsigned i = 0; i < 15; i++) if (d->pipelines[i]) DestroyPipeline(d->device, d->pipelines[i], a);
+    for (unsigned i = 0; i < HYBRIS_BC_KERNEL_COUNT; i++)
+        if (d->pipelines[i]) DestroyPipeline(d->device, d->pipelines[i], a);
     if (d->layout) DestroyPipelineLayout(d->device, d->layout, a);
     if (d->descriptor_layout) DestroyDescriptorSetLayout(d->device, d->descriptor_layout, a);
     pthread_mutex_destroy(&d->guard);
@@ -156,7 +158,9 @@ VkResult hybris_bc_decode_record(struct hybris_bc_decoder *d,
     VkResult result = hybris_bc_prepare(r, limits, &push);
     if (result != VK_SUCCESS) return result;
     VkPipeline selected;
-    result = pipeline(d, variant(r), &selected);
+    int v = variant(r);
+    if (r->fast && v >= 9) v += 6;
+    result = pipeline(d, v, &selected);
     if (result != VK_SUCCESS) return result;
     PROC(CmdBindPipeline); PROC(CmdBindDescriptorSets); PROC(CmdPushConstants); PROC(CmdDispatch);
     CmdBindPipeline(command, VK_PIPELINE_BIND_POINT_COMPUTE, selected);

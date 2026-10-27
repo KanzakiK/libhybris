@@ -80,9 +80,10 @@ uint outw[4u * ROW_WORDS]; /* the block's texels, packed */
 uint bswap32(uint v) { return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24); }
 
 #if defined(TRANSCODE)
-/* How hard the encoders search (VKBRIDGE_BC_TRANSCODE_QUALITY, a specialization constant): 0 fast,
- * 1 the default, 2 high. */
-layout(constant_id = 0) const uint BC_QUALITY = 1u;
+/* Encoder search effort is fixed in each generated variant: 0 fast, 1 normal. */
+#ifndef BC_QUALITY
+#define BC_QUALITY 1u
+#endif
 ivec4 g_px[16]; /* the block's texels, 8-bit RGBA, for the encoder */
 uint g_bc7_parts, g_bc7_part, g_bc7_mask; /* a BC7 block's subsets, partition and its subset per texel */
 #if defined(ENC_ETC2)

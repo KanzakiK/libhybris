@@ -19,6 +19,10 @@ Local adaptations preserve the existing RGB8/RGB16F backing formats and
 16-bit BC4/BC5 outputs. Work is scheduled per 4x4 block, with padded block
 rows in scratch; the transfer adapter supplies bufferRowLength explicitly.
 The existing raw BC backing remains authoritative for copies and readback.
+As in MaliBridge's automatic policy, mip levels of at least 1,048,576 texels
+use the faster encoder search; smaller levels retain the normal search.
+Quality is compiled into separate kernels rather than specialized by the
+vendor compiler at runtime. All pieces of one mip level use the same quality.
 ETC2/EAC/ASTC 4x4 are used only when their native features and the exact image
 creation parameters are supported. Images requesting transfer-source usage
 also require native transfer-source and source-blit support in the target format.
