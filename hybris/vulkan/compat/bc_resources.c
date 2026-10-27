@@ -4,6 +4,8 @@
 #include "bc_policy.h"
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <sys/auxv.h>
 
 #define PROC(name) PFN_vk##name name = (PFN_vk##name)device->resolver(device->handle, "vk" #name)
 static int emulates(struct hybris_bc_device *device, VkFormat format)
@@ -33,6 +35,11 @@ static VkResult VKAPI_CALL create_image(VkDevice handle, const VkImageCreateInfo
     } else {
         result = CreateImage(handle, info, allocator, out);
     }
+    const char *trace = getauxval(AT_SECURE) ? NULL : getenv("HYBRIS_VULKAN_TRACE");
+    if (emulates(device, info->format) && trace && !strcmp(trace, "1"))
+        fprintf(stderr, "HYBRIS_BC_IMAGE format=%u backing=%u extent=%ux%ux%u flags=0x%x usage=0x%x result=%d\n",
+            info->format, resource->emulated.decoded_format, info->extent.width, info->extent.height,
+            info->extent.depth, info->flags, info->usage, result);
     if (result != VK_SUCCESS) { hybris_bc_free(device, resource); return result; }
     resource->handle = *out;
     resource->format = info->format;

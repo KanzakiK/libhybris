@@ -2,6 +2,9 @@
 #define VK_NO_PROTOTYPES
 #include "bc_decode.h"
 #include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/auxv.h>
 #include "shaders/bc_decode.inc"
 
 #define PROC(name) PFN_vk##name name = (PFN_vk##name)d->resolver(d->device, "vk" #name)
@@ -96,6 +99,9 @@ static VkResult pipeline(struct hybris_bc_decoder *d, int v, VkPipeline *out)
                     .stage=VK_SHADER_STAGE_COMPUTE_BIT, .module=shader, .pName="main"}, .layout=d->layout};
             result = CreateComputePipelines(d->device, VK_NULL_HANDLE, 1, &create, a, &d->pipelines[v]);
             DestroyShaderModule(d->device, shader, a);
+            const char *trace = getauxval(AT_SECURE) ? NULL : getenv("HYBRIS_VULKAN_TRACE");
+            if (trace && !strcmp(trace, "1"))
+                fprintf(stderr, "HYBRIS_BC_KERNEL variant=%d result=%d\n", v, result);
         }
     }
     *out = d->pipelines[v];

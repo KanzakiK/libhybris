@@ -109,7 +109,9 @@ VkResult hybris_bc_image_describe(const VkImageCreateInfo *info, struct hybris_b
         info->tiling != VK_IMAGE_TILING_OPTIMAL ||
         info->samples != VK_SAMPLE_COUNT_1_BIT ||
         (info->initialLayout != VK_IMAGE_LAYOUT_UNDEFINED && info->initialLayout != VK_IMAGE_LAYOUT_PREINITIALIZED) ||
-        (info->flags & ~(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT)) ||
+        (info->flags & ~(VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT | VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT |
+                        VK_IMAGE_CREATE_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT |
+                        VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT | VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT)) ||
         ((info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) && !hybris_bc_mutable_format(info->format)) ||
         !info->usage ||
         (info->usage & ~(VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT)) ||
