@@ -17,6 +17,9 @@ processes".
 In other words it allows you to load drivers that link against the bionic c
 library inside processes whose native c library is e.g. glibc, musl, ...
 
+The `arlinux` branch supplies both glibc and Bionic Vulkan builds from the same
+source revision; see the [component build ownership guide](arlinux/BUILD.md).
+
 This allows us to load graphics drivers, or any other driver that's sitting
 inside an Android "so" file and utilize them in a non-Android-based
 Linux distribution.
