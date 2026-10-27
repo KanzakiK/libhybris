@@ -33,7 +33,7 @@ cp -r reference/bc7 reference/bc6h "$PROBE_SRC/reference/"
 cp "$ROOT/hybris/vulkan/compat/"bc_decode.{c,h} "$PROBE_SRC/compat/"
 cp "$ROOT/hybris/vulkan/compat/"primitive_adapter.{c,h} "$PROBE_SRC/compat/"
 cp "$ROOT/hybris/vulkan/compat/"{spirv_clip.c,spirv_builtins.c,spirv_entry.c,spirv_decorations.c,clip_distance.h,spirv_builtins.h,spirv_entry.h,spirv_decorations.h,scaled_vertex.h,spirv_literals.inc,spirv_results.inc} "$PROBE_SRC/compat/"
-cp "$ROOT/hybris/vulkan/compat/shaders/"bc7.glsl "$ROOT/hybris/vulkan/compat/shaders/"bc6h.glsl "$ROOT/hybris/vulkan/compat/shaders/"LICENSE.bcdec "$ROOT/hybris/vulkan/compat/shaders/"bc_decode.{comp,inc} "$ROOT/hybris/vulkan/compat/shaders/generate-bc.py" "$PROBE_SRC/compat/shaders/"
+cp "$ROOT/hybris/vulkan/compat/shaders/"*.glsl "$ROOT/hybris/vulkan/compat/shaders/"LICENSE.bcdec "$ROOT/hybris/vulkan/compat/shaders/"bc_decode.{comp,inc} "$ROOT/hybris/vulkan/compat/shaders/generate-bc.py" "$ROOT/hybris/vulkan/compat/shaders/MALIBRIDGE.md" "$ROOT/hybris/vulkan/compat/shaders/NOTICE.MaliBridge" "$PROBE_SRC/compat/shaders/"
 cp bc_half_verify.h bc6h_fixture.inc bc7_fixture.inc widget_pipeline.h bc_image_verify.h bc_fixture.h native_buffer_render.h native_buffer_fixture.h scaled_divisor.h scaled_fixture.h allocation_fixture.h render_path.h tls_fixture.cpp sync_fixture.h stdio_fixture.h widget_fixture.h "$PROBE_SRC/"
 for source in "${SOURCES[@]}"; do
     [[ "$source" == compat/* ]] || cp "$source" "$PROBE_SRC/"

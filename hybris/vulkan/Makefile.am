@@ -1,5 +1,8 @@
 if HAS_VULKAN_HEADERS
 
+bclicensedir = $(libdir)/licenses/libhybris-vulkan
+bclicense_DATA = $(srcdir)/../../LICENSE.GPL3 compat/shaders/MALIBRIDGE.md compat/shaders/NOTICE.MaliBridge compat/shaders/LICENSE.bcdec
+
 lib_LTLIBRARIES = \
 	libvulkan.la \
 	libhybris-vulkan-icd.la \
@@ -69,7 +72,7 @@ libvulkan_la_LDFLAGS = \
 
 # Optional standard-loader backend; no default ICD JSON is installed.
 libhybris_vulkan_icd_la_SOURCES = icd/icd.c icd/instance.c icd/instance.h icd/device.c icd/device.h icd/wsi.c icd/wsi.h icd/swapchain.c icd/swapchain.h icd/vk_android_native_buffer.h icd/hwvulkan.h icd/physical_commands.inc
-EXTRA_DIST = compat/shaders/bc7.glsl compat/shaders/bc6h.glsl compat/shaders/LICENSE.bcdec icd/README.md compat/shaders/bc_decode.comp compat/shaders/generate-bc.py compat/shaders/polygon_indices.comp compat/shaders/generate-polygon.py layer/VkLayer_hybris_compat.json
+EXTRA_DIST = compat/shaders/bc_tables.glsl compat/shaders/astc_tables.glsl compat/shaders/astc_enc.glsl compat/shaders/etc2_enc.glsl compat/shaders/eac_enc.glsl compat/shaders/MALIBRIDGE.md compat/shaders/LICENSE.bcdec icd/README.md compat/shaders/bc_decode.comp compat/shaders/generate-bc.py compat/shaders/polygon_indices.comp compat/shaders/generate-polygon.py layer/VkLayer_hybris_compat.json
 libhybris_vulkan_icd_la_CFLAGS = $(libvulkan_la_CFLAGS) -fvisibility=hidden
 libhybris_vulkan_icd_la_CXXFLAGS = $(libvulkan_la_CXXFLAGS) -fvisibility=hidden
 libhybris_vulkan_icd_la_LDFLAGS = \

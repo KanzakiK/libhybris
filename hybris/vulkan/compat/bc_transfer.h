@@ -6,7 +6,7 @@
 #include "bc_command_state.h"
 struct hybris_bc_transfer_pool;
 struct hybris_bc_transfer {
-    const struct hybris_bc_decoder *decoder;
+    struct hybris_bc_decoder *decoder;
     const VkPhysicalDeviceMemoryProperties *memory;
     const VkPhysicalDeviceLimits *limits;
     struct hybris_bc_transfer_pool *pools;
@@ -15,7 +15,7 @@ struct hybris_bc_transfer {
     VkDeviceSize scratch_size;
 };
 void hybris_bc_transfer_init(struct hybris_bc_transfer *transfer,
-    const struct hybris_bc_decoder *decoder, const VkPhysicalDeviceMemoryProperties *memory,
+    struct hybris_bc_decoder *decoder, const VkPhysicalDeviceMemoryProperties *memory,
     const VkPhysicalDeviceLimits *limits);
 /* Retire only when the owning command buffer may be reset/freed. */
 void hybris_bc_transfer_finish(struct hybris_bc_transfer *transfer);

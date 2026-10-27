@@ -11,7 +11,7 @@ struct hybris_bc_transfer_pool {
     struct hybris_bc_transfer_pool *next;
 };
 void hybris_bc_transfer_init(struct hybris_bc_transfer *t,
-    const struct hybris_bc_decoder *decoder, const VkPhysicalDeviceMemoryProperties *memory,
+    struct hybris_bc_decoder *decoder, const VkPhysicalDeviceMemoryProperties *memory,
     const VkPhysicalDeviceLimits *limits)
 {
     memset(t, 0, sizeof(*t));
@@ -121,17 +121,23 @@ static VkResult decode(struct hybris_bc_transfer *t, VkCommandBuffer command,
     VkDeviceSize row_bytes = ((extent.width + UINT64_C(3)) / 4) * image->block_bytes;
     VkDeviceSize alignment = t->limits->minStorageBufferOffsetAlignment;
     if (!alignment) alignment = 1;
-    uint32_t texel_bytes = image->decoded_format == VK_FORMAT_R16G16B16_SFLOAT ? 6 :
-        image->decoded_format == VK_FORMAT_R16G16B16A16_SFLOAT ? 8 : 4;
-    uint32_t max_width = (uint32_t)(t->scratch_size / (16 * texel_bytes)) * 4;
+    struct hybris_bc_region representation = {.format = image->format, .output_format = image->decoded_format,
+        .rgb16 = image->decoded_format == VK_FORMAT_R16G16B16_SFLOAT,
+        .rgb8 = image->decoded_format == VK_FORMAT_R8G8B8_UNORM || image->decoded_format == VK_FORMAT_R8G8B8_SRGB};
+    uint32_t block_bytes = hybris_bc_output_block_bytes(&representation);
+    if (!block_bytes) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    uint32_t max_width = (uint32_t)(t->scratch_size / block_bytes) * 4;
     if (!max_width) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     int volume = image->type == VK_IMAGE_TYPE_3D;
     uint32_t slices = volume ? region->imageExtent.depth : region->imageSubresource.layerCount;
     uint32_t first_slice = volume ? (uint32_t)region->imageOffset.z : region->imageSubresource.baseArrayLayer;
     for (uint32_t layer = 0; layer < slices; ++layer) {
-        for (uint32_t y = 0; y < region->imageExtent.height; y += 4) {
+        uint32_t tile_width = region->imageExtent.width < max_width ? region->imageExtent.width : max_width;
+        uint32_t tile_rows = (uint32_t)(t->scratch_size / (((uint64_t)tile_width + 3) / 4 * block_bytes));
+        uint32_t max_height = tile_rows * 4;
+        for (uint32_t y = 0; y < region->imageExtent.height;) {
             uint32_t height = region->imageExtent.height - y;
-            if (height > 4) height = 4;
+            if (height > max_height) height = max_height;
             for (uint32_t x = 0; x < region->imageExtent.width;) {
                 uint32_t width = region->imageExtent.width - x;
                 if (width > max_width) width = max_width;
@@ -145,13 +151,15 @@ static VkResult decode(struct hybris_bc_transfer *t, VkCommandBuffer command,
                 available = (available - (source - base)) / image->block_bytes;
                 if (!available) return VK_ERROR_FORMAT_NOT_SUPPORTED;
                 if ((width + UINT64_C(3)) / 4 > available) width = (uint32_t)(available * 4);
-                VkDeviceSize range = source - base + ((width + UINT64_C(3)) / 4) * image->block_bytes;
+                VkDeviceSize range = source - base + (((height + UINT64_C(3)) / 4 - 1) * row_bytes) +
+                    ((width + UINT64_C(3)) / 4) * image->block_bytes;
+                if (range > t->limits->maxStorageBufferRange) return VK_ERROR_FORMAT_NOT_SUPPORTED;
                 VkDescriptorSet set;
                 result = descriptors(t, &set);
                 if (result != VK_SUCCESS) return result;
                 VkDescriptorBufferInfo buffers[2] = {
                     {.buffer = image->blocks, .offset = base, .range = range},
-                    {.buffer = t->scratch, .range = ((VkDeviceSize)width * height * texel_bytes + 3) & ~UINT64_C(3)}};
+                    {.buffer = t->scratch, .range = ((VkDeviceSize)width + 3) / 4 * ((height + UINT64_C(3)) / 4) * block_bytes}};
                 VkWriteDescriptorSet writes[2] = {0};
                 for (uint32_t i = 0; i < 2; ++i) {
                     writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -166,17 +174,19 @@ static VkResult decode(struct hybris_bc_transfer *t, VkCommandBuffer command,
                  * again, with the preceding execution still reading scratch. */
                 buffer_barrier(t, command, t->scratch, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
-                struct hybris_bc_region decoding = {.format = image->format,
+                struct hybris_bc_region decoding = {.format = image->format, .output_format = image->decoded_format,
                     .rgb16 = image->decoded_format == VK_FORMAT_R16G16B16_SFLOAT,
                     .rgb8 = image->decoded_format == VK_FORMAT_R8G8B8_UNORM || image->decoded_format == VK_FORMAT_R8G8B8_SRGB,
                     .width = width, .height = height, .layers = 1,
+                    .row_length = (extent.width + 3u) & ~3u,
                     .source_offset = source - base, .source_range = range,
                     .destination_range = buffers[1].range};
                 result = hybris_bc_decode_record(t->decoder, command, set, &decoding, t->limits);
                 if (result != VK_SUCCESS) return result;
                 buffer_barrier(t, command, t->scratch, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                     VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-                VkBufferImageCopy copy = {.imageSubresource = region->imageSubresource,
+                VkBufferImageCopy copy = {.bufferRowLength = (width + 3u) & ~3u,
+                    .bufferImageHeight = (height + 3u) & ~3u, .imageSubresource = region->imageSubresource,
                     .imageOffset = {region->imageOffset.x + (int32_t)x, region->imageOffset.y + (int32_t)y, 0},
                     .imageExtent = {width, height, 1}};
                 if (volume) copy.imageOffset.z = region->imageOffset.z + (int32_t)layer;
@@ -185,6 +195,7 @@ static VkResult decode(struct hybris_bc_transfer *t, VkCommandBuffer command,
                 CmdCopyBufferToImage(command, t->scratch, image->image, layout, 1, &copy);
                 x += width;
             }
+            y += height;
         }
     }
     return VK_SUCCESS;

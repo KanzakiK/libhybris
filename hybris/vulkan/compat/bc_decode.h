@@ -1,12 +1,14 @@
-/* SPDX-License-Identifier: Apache-2.0 */
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 #ifndef HYBRIS_BC_DECODE_H
 #define HYBRIS_BC_DECODE_H
 #include <vulkan/vulkan.h>
+#include <pthread.h>
 
 /* Internal GPU kernel, not an advertisement of Vulkan compressed-image support.
  * Output is RGBA8 for BC1-3/BC7, R16 UNORM/SNORM for BC4, RG16 for BC5.
- * BC1 RGB can instead write tightly packed RGB8, four pixels per three words.
- * BC4 writes pairs of texels per uint32. Partial final words have zero padding.
+ * BC1 RGB can instead write RGB8. Scratch rows/layers are padded to 4x4 blocks;
+ * output size is ceil(width/4)*ceil(height/4)*layers*output_block_bytes.
+ * output_format may select native ETC2/EAC/ASTC 4x4 transcoding.
  * Source/destination are non-overlapping storage-buffer descriptor ranges.
  * Offsets below are relative to those ranges, not to bound device memory.
  * The caller owns buffers/descriptors and their synchronization/lifetime.
@@ -18,10 +20,14 @@ struct hybris_bc_decoder {
     PFN_vkGetDeviceProcAddr resolver;
     VkDescriptorSetLayout descriptor_layout;
     VkPipelineLayout layout;
-    VkPipeline pipeline;
+    VkPipeline pipelines[15];
+    pthread_mutex_t guard;
+    VkAllocationCallbacks allocator;
+    int custom_allocator;
 };
 struct hybris_bc_region {
     VkFormat format;
+    VkFormat output_format; /* UNDEFINED selects the decoded representation. */
     VkBool32 rgb16; /* BC6H only: packed RGB16F instead of RGBA16F output */
     VkBool32 rgb8; /* BC1 RGB only: packed RGB8 instead of RGBA8 output */
     uint32_t width, height, layers;
@@ -30,8 +36,8 @@ struct hybris_bc_region {
     VkDeviceSize source_range, destination_range;
 };
 struct hybris_bc_push {
-    uint32_t mode, source_word, row_blocks, layer_blocks;
-    uint32_t width, height, pixels, first_pixel, destination_word, chunk_pixels;
+    uint32_t source_word, row_blocks, layer_blocks, flags;
+    uint32_t destination_word, pad, width, height;
 };
 VkResult hybris_bc_decoder_create(VkDevice device, PFN_vkGetDeviceProcAddr resolver,
     const VkAllocationCallbacks *allocator, struct hybris_bc_decoder *decoder);
@@ -43,7 +49,8 @@ void hybris_bc_decoder_destroy(struct hybris_bc_decoder *decoder,
  * INITIALIZATION_FAILED. This API does not validate application Vulkan usage. */
 VkResult hybris_bc_prepare(const struct hybris_bc_region *region,
     const VkPhysicalDeviceLimits *limits, struct hybris_bc_push *push);
-VkResult hybris_bc_decode_record(const struct hybris_bc_decoder *decoder,
+uint32_t hybris_bc_output_block_bytes(const struct hybris_bc_region *region);
+VkResult hybris_bc_decode_record(struct hybris_bc_decoder *decoder,
     VkCommandBuffer command, VkDescriptorSet descriptors,
     const struct hybris_bc_region *region, const VkPhysicalDeviceLimits *limits);
 #endif

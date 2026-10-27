@@ -1,5 +1,13 @@
 # What is libhybris
 
+This fork's Vulkan BC kernels incorporate
+[MaliBridge by ASEbrahim](https://github.com/ASEbrahim/MaliBridge), under
+GPL-3.0-or-later with the additional terms in
+[NOTICE.MaliBridge](hybris/vulkan/compat/shaders/NOTICE.MaliBridge).
+The Vulkan libraries linking these kernels are distributed under GPL-3.0-or-later;
+see [kernel provenance and adaptations](hybris/vulkan/compat/shaders/MALIBRIDGE.md)
+and [the license](LICENSE.GPL3). Other source files retain their original notices.
+
 This fork enables its implemented graphics compatibility switches by default.
 See [compatibility defaults](docs/compatibility-defaults.md) for overrides,
 capability guards and known limitations.

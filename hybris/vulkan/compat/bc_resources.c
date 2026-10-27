@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #define VK_NO_PROTOTYPES
 #include "bc_context.h"
+#include "bc_policy.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -27,7 +28,7 @@ static VkResult VKAPI_CALL create_image(VkDevice handle, const VkImageCreateInfo
     VkResult result;
     if (emulates(device, info->format)) {
         result = hybris_bc_image_create(handle, device->resolver, &device->memory, info,
-            device->rgb_mask, allocator, &resource->emulated);
+            device->rgb_mask, hybris_bc_storage_format(device->physical, info), allocator, &resource->emulated);
         if (result == VK_SUCCESS) *out = resource->emulated.image;
     } else {
         result = CreateImage(handle, info, allocator, out);
@@ -223,7 +224,9 @@ static VkResult VKAPI_CALL create_view(VkDevice handle, const VkImageViewCreateI
     if (resource && resource->emulated.image) {
         if (!hybris_bc_view_format_allowed(resource->format, info->format, resource->emulated.flags))
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
-        translated.format = (resource->emulated.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ?
+        if (resource->emulated.decoded_format == hybris_bc_transcode_format(resource->format))
+            translated.format = hybris_bc_transcode_format(info->format);
+        else translated.format = (resource->emulated.flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ?
             hybris_bc_image_format(info->format, 0) : resource->emulated.decoded_format;
     }
     PROC(CreateImageView);

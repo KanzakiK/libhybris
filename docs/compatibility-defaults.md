@@ -9,13 +9,14 @@ Native format support takes precedence; forced emulation remains opt-in.
 | HYBRIS_VULKAN_COMPAT_SCALED_VERTEX | Missing-format conversion | 0 |
 | HYBRIS_VULKAN_COMPAT_PACKED_VERTEX | Missing-format conversion | 0 |
 | HYBRIS_BC_TEXTURES | missing | 0 |
+| HYBRIS_BC_TRANSCODE | Native ETC2/EAC/ASTC for eligible sampled BC images | 0 |
 | HYBRIS_VULKAN_COMPAT_UNUSED_BUILTINS | 1 | 0 |
 | HYBRIS_VULKAN_COMPAT_POINT_SIZE | 1 | 0 |
 | HYBRIS_VULKAN_COMPAT_INOUT | 1 | 0 |
 | HYBRIS_VULKAN_COMPAT_VERTEX_STORES | 1, restricted to the inspected driver | 0 |
 | HYBRIS_MALI_MMUD_SKIP_LOADER_CHECK | 1, restricted to the matching driver build | 0 |
 
-The first six switches remain disabled during secure execution. Existing
+The format/shader switches above remain disabled during secure execution. Existing
 secure-execution behavior for vertex stores and the Mali loader quirk is
 unchanged. Capability checks, shader eligibility checks and driver guards
 remain in place. Debug logging, dumps, validation and the `force` values

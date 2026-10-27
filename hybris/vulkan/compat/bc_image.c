@@ -34,6 +34,25 @@ VkFormat hybris_bc_image_format(VkFormat format, unsigned rgb_mask)
     }
 }
 
+VkFormat hybris_bc_transcode_format(VkFormat format)
+{
+    switch (format) {
+    case VK_FORMAT_BC1_RGB_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK;
+    case VK_FORMAT_BC1_RGB_SRGB_BLOCK: return VK_FORMAT_ETC2_R8G8B8_SRGB_BLOCK;
+    case VK_FORMAT_BC1_RGBA_UNORM_BLOCK: return VK_FORMAT_ETC2_R8G8B8A1_UNORM_BLOCK;
+    case VK_FORMAT_BC1_RGBA_SRGB_BLOCK: return VK_FORMAT_ETC2_R8G8B8A1_SRGB_BLOCK;
+    case VK_FORMAT_BC2_UNORM_BLOCK: case VK_FORMAT_BC3_UNORM_BLOCK: case VK_FORMAT_BC7_UNORM_BLOCK:
+        return VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+    case VK_FORMAT_BC2_SRGB_BLOCK: case VK_FORMAT_BC3_SRGB_BLOCK: case VK_FORMAT_BC7_SRGB_BLOCK:
+        return VK_FORMAT_ASTC_4x4_SRGB_BLOCK;
+    case VK_FORMAT_BC4_UNORM_BLOCK: return VK_FORMAT_EAC_R11_UNORM_BLOCK;
+    case VK_FORMAT_BC4_SNORM_BLOCK: return VK_FORMAT_EAC_R11_SNORM_BLOCK;
+    case VK_FORMAT_BC5_UNORM_BLOCK: return VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
+    case VK_FORMAT_BC5_SNORM_BLOCK: return VK_FORMAT_EAC_R11G11_SNORM_BLOCK;
+    default: return VK_FORMAT_UNDEFINED;
+    }
+}
+
 int hybris_bc_mutable_format(VkFormat format)
 {
     return (format >= VK_FORMAT_BC1_RGB_UNORM_BLOCK && format <= VK_FORMAT_BC3_SRGB_BLOCK) ||
@@ -155,7 +174,7 @@ void hybris_bc_image_backing_info(const struct hybris_bc_image *image,
 
 VkResult hybris_bc_image_create(VkDevice device, PFN_vkGetDeviceProcAddr resolver,
     const VkPhysicalDeviceMemoryProperties *memory, const VkImageCreateInfo *info,
-    unsigned rgb_mask, const VkAllocationCallbacks *allocator, struct hybris_bc_image *image)
+    unsigned rgb_mask, VkFormat output_format, const VkAllocationCallbacks *allocator, struct hybris_bc_image *image)
 {
     if (!image || !device || !resolver || !memory || !info)
         return VK_ERROR_INITIALIZATION_FAILED;
@@ -179,6 +198,7 @@ VkResult hybris_bc_image_create(VkDevice device, PFN_vkGetDeviceProcAddr resolve
     /* The two transfer functions must use the same storage representation. */
     image->decoded_format = hybris_bc_image_format(info->format,
         (info->flags & VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT) ? 0 : rgb_mask);
+    if (output_format != VK_FORMAT_UNDEFINED) image->decoded_format = output_format;
     decoded.format = image->decoded_format;
     decoded.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     result = CreateImage(device, &decoded, allocator, &image->image);

@@ -26,6 +26,7 @@ struct hybris_bc_resource {
 };
 struct hybris_bc_device {
     VkDevice handle;
+    VkPhysicalDevice physical;
     PFN_vkGetDeviceProcAddr resolver;
     /* Immutable native recording targets, resolved before device publication. */
     PFN_vkCmdBindPipeline bind_pipeline;

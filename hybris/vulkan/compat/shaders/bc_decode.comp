@@ -1,198 +1,651 @@
-// SPDX-License-Identifier: Apache-2.0
 #version 450
+/* SPDX-License-Identifier: GPL-3.0-or-later
+ * Copyright (C) 2026 ASEbrahim and MaliBridge contributors
+ *
+ * BCn block decoder for the Mali bridge's BC texture emulation. One invocation decodes one 4x4
+ * block from the copy's source buffer and writes its texels, packed in the decoded format, to a
+ * scratch buffer laid out as whole blocks (rows of 4 * blocks texels, 4 * blocks rows per layer);
+ * the bridge then copies the buffer into the image, which so needs no storage usage. The
+ * arithmetic follows bcdec (third_party/bcdec, MIT/Unlicense, Sergii Kudlai) so the output can be
+ * checked bit-for-bit against it. Built once per format family (FMT_BC1 ... FMT_BC7), and BC1
+ * once more with PACK16: R5G6B5 (BC1 without alpha) or A1R5G5B5 texels, half the memory of RGBA8;
+ * BC1's endpoints are 5:6:5, so only interpolated colours lose precision.
+ *
+ * Transcoding variants (ENC_ETC2, ENC_ASTC, ENC_EAC, ENC_ASTC_HDR) encode the decoded block again,
+ * into ETC2 RGB8 / RGB8A1 (BC1), ASTC 4x4 (BC2, BC3, BC7), EAC R11 / RG11 (BC4, BC5) or ASTC 4x4
+ * HDR (BC6H), and write the blocks to the scratch buffer in order (rows of blocks, layer after
+ * layer): the image stays compressed on a GPU without BC (etc2_enc.glsl, astc_enc.glsl,
+ * eac_enc.glsl, astc_hdr_enc.glsl). BC_QUALITY (below) trades their search for time.
+ */
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, binding = 0) readonly buffer Src { uint w[]; } src;
+layout(std430, binding = 1) writeonly buffer Dst { uint w[]; } dst;
+
+#if defined(ENC_ETC2) || defined(ENC_ASTC) || defined(ENC_EAC) || defined(ENC_ASTC_HDR) || defined(ENC_ASTCN)
+#define TRANSCODE
+#endif
+
+/* 32-bit words one row of a block's texels takes: 16-bit, RGBA16F, R8, RG8, RGBA8. */
+#if defined(TRANSCODE)
+#define ROW_WORDS 1u
+#elif defined(OUT_RGB8)
+#define ROW_WORDS 3u
+#elif defined(OUT_RGB16)
+#define ROW_WORDS 6u
+#elif defined(PACK16)
+#define ROW_WORDS 2u
+#elif defined(FMT_BC6H)
+#define ROW_WORDS 8u
+#elif defined(FMT_BC4)
+#define ROW_WORDS 2u
+#elif defined(FMT_BC5)
+#define ROW_WORDS 4u
+#else
+#define ROW_WORDS 4u
+#endif
+
+layout(push_constant) uniform PC {
+    uint src_word;     /* first block, in 32-bit words from the bound range's start */
+    uint row_blocks;   /* blocks per row in the buffer */
+    uint layer_blocks; /* blocks per layer in the buffer */
+    uint flags;        /* 1: BC1 without alpha (alpha forced to 1; R5G6B5 with PACK16); 2: signed (BC4/5/6H);
+                        * 4: ETC2 RGB8A1 (punch-through alpha) */
+    uint dst_word;     /* where the region's texels start in the scratch buffer, in 32-bit words */
+    uint pad;
+    uvec2 extent;      /* texels to decode (ENC_ASTCN: the piece's, from the first ASTC block's corner) */
+#if defined(ENC_ASTCN)
+    uvec4 nx;          /* ENC_ASTCN: x: how far the region starts past its first ASTC block's corner (bits 0-3 x,
+                        * 4-7 y) and its first block row bound (bits 8-31); y: the piece's first texel row (from
+                        * that corner); zw: the region's extent in texels */
+#endif
+} pc;
+
 #extension GL_GOOGLE_include_directive : require
-#include "bc7.glsl"
-#include "bc6h.glsl"
-layout(local_size_x = 64) in;
-layout(set = 0, binding = 0, std430) readonly buffer Source { uint data[]; } src;
-layout(set = 0, binding = 1, std430) writeonly buffer Destination { uint data[]; } dst;
-layout(push_constant) uniform Region {
-    uint mode; // 0..3: BC1 RGB/RGBA, BC2, BC3; 4..7: BC4/5 U/S; 8: packed RGB8; 9: BC7; 10/11: BC6H RGBA16F U/S; 12/13: packed RGB16F U/S
-    uint source_word;
-    uint row_blocks;
-    uint layer_blocks;
-    uint width;
-    uint height;
-    uint pixels;
-    uint first_pixel;
-    uint destination_word;
-    uint chunk_pixels;
-} r;
+#include "bc_tables.glsl"
 
-uvec3 rgb565(uint value)
+uint bits(uvec4 b, uint pos, uint n)
 {
-    uvec3 c = uvec3(value >> 11, (value >> 5) & 63, value & 31);
-    return (c << uvec3(3, 2, 3)) | (c >> uvec3(2, 4, 2));
+    if (n == 0u) return 0u;
+    uint wi = pos >> 5, o = pos & 31u;
+    uint v = b[wi] >> o;
+    if (o + n > 32u && wi < 3u) v |= b[wi + 1u] << (32u - o);
+    return n == 32u ? v : (v & ((1u << n) - 1u));
 }
 
-uint color_rgba(uint word, uint within, uint mode)
+int sext(int v, int n) { return (v << (32 - n)) >> (32 - n); }
+
+uint outw[4u * ROW_WORDS]; /* the block's texels, packed */
+
+uint bswap32(uint v) { return (v >> 24) | ((v >> 8) & 0xff00u) | ((v << 8) & 0xff0000u) | (v << 24); }
+
+#if defined(TRANSCODE)
+/* How hard the encoders search (VKBRIDGE_BC_TRANSCODE_QUALITY, a specialization constant): 0 fast,
+ * 1 the default, 2 high. */
+layout(constant_id = 0) const uint BC_QUALITY = 1u;
+ivec4 g_px[16]; /* the block's texels, 8-bit RGBA, for the encoder */
+uint g_bc7_parts, g_bc7_part, g_bc7_mask; /* a BC7 block's subsets, partition and its subset per texel */
+#if defined(ENC_ETC2)
+#include "etc2_enc.glsl"
+#elif defined(ENC_ASTC)
+#include "astc_enc.glsl"
+#elif defined(ENC_ASTC_HDR)
+uvec3 g_hpx[16]; /* BC6H: the block's texels as half floats */
+#include "astc_enc.glsl"
+#include "astc_hdr_enc.glsl"
+#elif defined(ENC_ASTCN)
+#include "astc_enc.glsl"
+#include "astcn_enc.glsl"
+#else
+#include "eac_enc.glsl"
+#endif
+#endif
+
+void put(uint tx, uint ty, vec4 v)
 {
-    uint endpoints = src.data[word];
-    uint c0 = endpoints & 65535, c1 = endpoints >> 16;
-    uvec3 a = rgb565(c0), b = rgb565(c1), color;
-    uint index = (src.data[word + 1] >> (within * 2)) & 3;
-    uint alpha = 255;
-    if (index == 0) color = a;
-    else if (index == 1) color = b;
-    else if (mode >= 2 || c0 > c1)
-        color = index == 2 ? (2 * a + b) / 3 : (a + 2 * b) / 3;
-    else if (index == 2) color = (a + b) / 2;
-    else {
-        color = uvec3(0);
-        if (mode == 1) alpha = 0;
+#if defined(ENC_ASTC_HDR)
+    g_hpx[ty * 4u + tx] = uvec3(packHalf2x16(vec2(v.r, 0.0)), packHalf2x16(vec2(v.g, 0.0)), packHalf2x16(vec2(v.b, 0.0)));
+#elif defined(TRANSCODE)
+    g_px[ty * 4u + tx] = ivec4(round(clamp(v, 0.0, 1.0) * 255.0));
+#elif defined(PACK16)
+    bool rgb = (pc.flags & 1u) != 0u;
+    uvec4 q = uvec4(round(clamp(v, 0.0, 1.0) * vec4(31.0, rgb ? 63.0 : 31.0, 31.0, 1.0)));
+    uint p = rgb ? (q.r << 11) | (q.g << 5) | q.b : (q.a << 15) | (q.r << 10) | (q.g << 5) | q.b;
+    outw[ty * 2u + (tx >> 1)] = bitfieldInsert(outw[ty * 2u + (tx >> 1)], p, int((tx & 1u) * 16u), 16);
+#elif defined(OUT_RGB16)
+    uvec3 h = uvec3(packHalf2x16(vec2(v.r, 0.0)), packHalf2x16(vec2(v.g, 0.0)), packHalf2x16(vec2(v.b, 0.0)));
+    for (uint channel = 0u; channel < 3u; channel++) {
+        uint half_at = tx * 3u + channel;
+        uint at = ty * 6u + half_at / 2u;
+        outw[at] = bitfieldInsert(outw[at], h[channel] & 0xffffu, int((half_at & 1u) * 16u), 16);
     }
-    return color.r | (color.g << 8) | (color.b << 16) | (alpha << 24);
-}
-
-uint rgb8_texel(uint pixel)
-{
-    uint x = pixel % r.width, y = (pixel / r.width) % r.height;
-    uint layer = pixel / (r.width * r.height);
-    uint block = layer * r.layer_blocks + (y / 4) * r.row_blocks + x / 4;
-    return color_rgba(r.source_word + block * 2, (y & 3) * 4 + (x & 3), 0) & 0xffffff;
-}
-
-uint index3(uint word, uint pixel)
-{
-    uint lo = src.data[word], hi = src.data[word + 1];
-    uint bit = 16 + pixel * 3;
-    uint index;
-    if (bit < 32) {
-        index = lo >> bit;
-        // Only pixel 5 straddles words; never shift a 32-bit value by 32.
-        if (bit == 31) index |= hi << 1;
-    } else index = hi >> (bit - 32);
-    return index & 7;
-}
-
-uint alpha3(uint word, uint pixel)
-{
-    uint lo = src.data[word];
-    uint a = lo & 255, b = (lo >> 8) & 255;
-    uint index = index3(word, pixel);
-    if (index == 0) return a;
-    if (index == 1) return b;
-    if (a > b) return ((8 - index) * a + (index - 1) * b) / 7;
-    if (index == 6) return 0;
-    if (index == 7) return 255;
-    return ((6 - index) * a + (index - 1) * b) / 5;
-}
-
-uint channel16(uint word, uint pixel, bool snorm)
-{
-    uint endpoints = src.data[word];
-    int a = int(endpoints & 255), b = int((endpoints >> 8) & 255);
-    int denominator = snorm ? 127 : 255;
-    int scale = snorm ? 32767 : 65535;
-    if (snorm) {
-        a = max(a >= 128 ? a - 256 : a, -127);
-        b = max(b >= 128 ? b - 256 : b, -127);
+#elif defined(FMT_BC6H)
+    outw[ty * 8u + tx * 2u] = packHalf2x16(v.rg);
+    outw[ty * 8u + tx * 2u + 1u] = packHalf2x16(v.ba);
+#elif defined(FMT_BC4)
+    uint value = (pc.flags & 2u) != 0u ? packSnorm2x16(v.rr) : packUnorm2x16(v.rr);
+    outw[ty * 2u + tx / 2u] = bitfieldInsert(outw[ty * 2u + tx / 2u], value & 0xffffu, int((tx & 1u) * 16u), 16);
+#elif defined(FMT_BC5)
+    outw[ty * 4u + tx] = (pc.flags & 2u) != 0u ? packSnorm2x16(v.rg) : packUnorm2x16(v.rg);
+#elif defined(OUT_RGB8)
+    uint value = packUnorm4x8(v);
+    for (uint channel = 0u; channel < 3u; channel++) {
+        uint byte_at = tx * 3u + channel;
+        uint at = ty * 3u + byte_at / 4u;
+        outw[at] = bitfieldInsert(outw[at], (value >> (channel * 8u)) & 255u, int((byte_at & 3u) * 8u), 8);
     }
-    int index = int(index3(word, pixel));
-    int numerator;
-    if (index == 0) numerator = a;
-    else if (index == 1) numerator = b;
-    else if (a > b) {
-        numerator = (8 - index) * a + (index - 1) * b;
-        denominator *= 7;
-    } else if (index == 6) return snorm ? uint(-32767) & 65535 : 0;
-    else if (index == 7) return uint(scale);
-    else {
-        numerator = (6 - index) * a + (index - 1) * b;
-        denominator *= 5;
-    }
-    // Quantize only once, after interpolation, to nearest UNORM16/SNORM16.
-    // Signed -127/-128 endpoint ordering is implementation-defined; saturate
-    // both before comparison. All arithmetic fits a signed 32-bit integer.
-    int magnitude = (abs(numerator) * scale + denominator / 2) / denominator;
-    return uint(numerator < 0 ? -magnitude : magnitude) & 65535;
+#else
+    outw[ty * 4u + tx] = packUnorm4x8(v);
+#endif
 }
 
-uvec2 bc6_texel(uint pixel)
+/* BC6H texels as the half floats the decoder made (no round trip through 32-bit floats). */
+void put_half(uint tx, uint ty, uvec3 h)
 {
-    uint x = pixel % r.width, y = (pixel / r.width) % r.height;
-    uint layer = pixel / (r.width * r.height);
-    uint block = layer * r.layer_blocks + (y / 4) * r.row_blocks + x / 4;
-    uint word = r.source_word + block * 4;
-    return bc6_rgba16(uvec4(src.data[word], src.data[word + 1], src.data[word + 2], src.data[word + 3]),
-                      (y & 3) * 4 + (x & 3), (r.mode & 1) != 0);
+#if defined(ENC_ASTC_HDR)
+    g_hpx[ty * 4u + tx] = h & 0xffffu;
+#elif defined(OUT_RGB16)
+    for (uint channel = 0u; channel < 3u; channel++) {
+        uint half_at = tx * 3u + channel;
+        uint at = ty * 6u + half_at / 2u;
+        outw[at] = bitfieldInsert(outw[at], h[channel] & 0xffffu, int((half_at & 1u) * 16u), 16);
+    }
+#elif defined(FMT_BC6H)
+    outw[ty * 8u + tx * 2u] = (h.x & 0xffffu) | (h.y << 16);
+    outw[ty * 8u + tx * 2u + 1u] = (h.z & 0xffffu) | (0x3c00u << 16);
+#endif
 }
+
+/* ------------------------------------------------------------------ BC1-3 */
+
+uvec4 rgb565(uint c)
+{
+    uint r = (c >> 11) & 31u, g = (c >> 5) & 63u, b = c & 31u;
+    return uvec4((r * 527u + 23u) >> 6, (g * 259u + 33u) >> 6, (b * 527u + 23u) >> 6, 255u);
+}
+
+void color_block(uint lo, uint idx, bool opaque, inout uvec4 texels[16])
+{
+    uint c0 = lo & 0xffffu, c1 = lo >> 16;
+    uint r0 = (c0 >> 11) & 31u, g0 = (c0 >> 5) & 63u, b0 = c0 & 31u;
+    uint r1 = (c1 >> 11) & 31u, g1 = (c1 >> 5) & 63u, b1 = c1 & 31u;
+    uvec4 ref[4];
+    ref[0] = rgb565(c0);
+    ref[1] = rgb565(c1);
+    if (c0 > c1 || opaque) {
+        ref[2] = uvec4(((2u * r0 + r1) * 351u + 61u) >> 7, ((2u * g0 + g1) * 2763u + 1039u) >> 11, ((2u * b0 + b1) * 351u + 61u) >> 7, 255u);
+        ref[3] = uvec4(((r0 + r1 * 2u) * 351u + 61u) >> 7, ((g0 + g1 * 2u) * 2763u + 1039u) >> 11, ((b0 + b1 * 2u) * 351u + 61u) >> 7, 255u);
+    } else {
+        ref[2] = uvec4(((r0 + r1) * 1053u + 125u) >> 8, ((g0 + g1) * 4145u + 1019u) >> 11, ((b0 + b1) * 1053u + 125u) >> 8, 255u);
+        ref[3] = uvec4(0u);
+    }
+    for (uint t = 0u; t < 16u; t++) texels[t] = ref[(idx >> (2u * t)) & 3u];
+}
+
+/* BC3's alpha block as bcdec decodes it (integer division). */
+void smooth_alpha(uint lo, uint hi, out uint a[16])
+{
+    uint a0 = lo & 0xffu, a1 = (lo >> 8) & 0xffu;
+    uint pal[8];
+    pal[0] = a0;
+    pal[1] = a1;
+    if (a0 > a1) {
+        pal[2] = (6u * a0 + a1) / 7u; pal[3] = (5u * a0 + 2u * a1) / 7u; pal[4] = (4u * a0 + 3u * a1) / 7u;
+        pal[5] = (3u * a0 + 4u * a1) / 7u; pal[6] = (2u * a0 + 5u * a1) / 7u; pal[7] = (a0 + 6u * a1) / 7u;
+    } else {
+        pal[2] = (4u * a0 + a1) / 5u; pal[3] = (3u * a0 + 2u * a1) / 5u; pal[4] = (2u * a0 + 3u * a1) / 5u;
+        pal[5] = (a0 + 4u * a1) / 5u; pal[6] = 0u; pal[7] = 255u;
+    }
+    uvec4 b = uvec4(lo, hi, 0u, 0u);
+    for (uint t = 0u; t < 16u; t++) a[t] = pal[bits(b, 16u + 3u * t, 3u)];
+}
+
+/* BC4/BC5 channel (bcdec's precise variant), as the byte pattern of the unsigned/signed value. */
+void bc4_channel(uint lo, uint hi, bool sgn, out uint v[16])
+{
+    int e0, e1;
+    if (sgn) {
+        e0 = max(sext(int(lo & 0xffu), 8), -127);
+        e1 = max(sext(int((lo >> 8) & 0xffu), 8), -127);
+    } else {
+        e0 = int(lo & 0xffu);
+        e1 = int((lo >> 8) & 0xffu);
+    }
+    const int w6[6] = int[6](9363, 18724, 28086, 37450, 46812, 56173);
+    const int w4[4] = int[4](13107, 26215, 39321, 52429);
+    int pal[8];
+    pal[0] = e0;
+    pal[1] = e1;
+    if (e0 > e1) {
+        for (int i = 0; i < 6; i++) pal[2 + i] = (w6[5 - i] * e0 + w6[i] * e1 + 32768) >> 16;
+    } else {
+        for (int i = 0; i < 4; i++) pal[2 + i] = (w4[3 - i] * e0 + w4[i] * e1 + 32768) >> 16;
+        pal[6] = sgn ? -127 : 0;
+        pal[7] = sgn ? 127 : 255;
+    }
+    uvec4 b = uvec4(lo, hi, 0u, 0u);
+    for (uint t = 0u; t < 16u; t++) v[t] = uint(pal[bits(b, 16u + 3u * t, 3u)]) & 0xffu;
+}
+
+/* The same channel unrounded, in EAC R11 units (0..2047, signed -1023..1023): the encoder starts
+ * from BC4's exact interpolants, not from their 8-bit roundings. */
+void bc4_exact(uint lo, uint hi, bool sgn, out float v[16])
+{
+    float e0, e1;
+    if (sgn) {
+        e0 = float(max(sext(int(lo & 0xffu), 8), -127));
+        e1 = float(max(sext(int((lo >> 8) & 0xffu), 8), -127));
+    } else {
+        e0 = float(lo & 0xffu);
+        e1 = float((lo >> 8) & 0xffu);
+    }
+    float pal[8];
+    pal[0] = e0;
+    pal[1] = e1;
+    if (e0 > e1) {
+        for (int i = 1; i < 7; i++) pal[1 + i] = (float(7 - i) * e0 + float(i) * e1) / 7.0;
+    } else {
+        for (int i = 1; i < 5; i++) pal[1 + i] = (float(5 - i) * e0 + float(i) * e1) / 5.0;
+        pal[6] = sgn ? -127.0 : 0.0;
+        pal[7] = sgn ? 127.0 : 255.0;
+    }
+    float sc = sgn ? 1023.0 / 127.0 : 2047.0 / 255.0;
+    uvec4 b = uvec4(lo, hi, 0u, 0u);
+    for (uint t = 0u; t < 16u; t++) v[t] = pal[bits(b, 16u + 3u * t, 3u)] * sc;
+}
+
+/* ------------------------------------------------------------------ BC6H */
+
+int bc6_unquantize(int val, int nbits, bool sgn)
+{
+    if (!sgn) {
+        if (nbits >= 15) return val;
+        if (val == 0) return 0;
+        if (val == (1 << nbits) - 1) return 0xffff;
+        return ((val << 16) + 0x8000) >> nbits;
+    }
+    if (nbits >= 16) return val;
+    int s = 0;
+    if (val < 0) { s = 1; val = -val; }
+    int unq;
+    if (val == 0) unq = 0;
+    else if (val >= (1 << (nbits - 1)) - 1) unq = 0x7fff;
+    else unq = ((val << 15) + 0x4000) >> (nbits - 1);
+    return s != 0 ? -unq : unq;
+}
+
+uint bc6_finish(int val, bool sgn)
+{
+    if (!sgn) return uint((val * 31) >> 6);
+    val = val < 0 ? -(((-val) * 31) >> 5) : (val * 31) >> 5;
+    uint s = 0u;
+    if (val < 0) { s = 0x8000u; val = -val; }
+    return s | uint(val);
+}
+
+void bc6h(uvec4 blk, bool sgn)
+{
+    uint pos = 0u;
+    uint code = bits(blk, 0u, 2u);
+    pos = 2u;
+    if (code > 1u) { code |= bits(blk, 2u, 3u) << 2; pos = 5u; }
+    int mode = BC6_MODE_OF_CODE[code];
+    if (mode < 0) {
+        for (uint t = 0u; t < 16u; t++) put(t & 3u, t >> 2, vec4(0.0, 0.0, 0.0, 1.0));
+        return;
+    }
+    int ep[12];
+    for (int i = 0; i < 12; i++) ep[i] = 0;
+    uint part_id = 0u;
+    for (uint e = BC6_LAYOUT_START[mode]; e < BC6_LAYOUT_START[mode + 1]; e++) {
+        uint d = BC6_LAYOUT[e];
+        uint target = d & 15u, n = (d >> 4) & 31u, sh = (d >> 9) & 31u;
+        uint v = bits(blk, pos, n);
+        pos += n;
+        if ((d & (1u << 14)) != 0u) v = bitfieldReverse(v) >> (32u - n);
+        if (target == 12u) part_id = v;
+        else ep[target] |= int(v << sh);
+    }
+    bool two = mode < 10;
+    int npts = two ? 4 : 2;
+    int w = BC6_BITS_W[mode];
+    if (sgn) { ep[0] = sext(ep[0], w); ep[4] = sext(ep[4], w); ep[8] = sext(ep[8], w); }
+    if ((mode != 9 && mode != 10) || sgn) {
+        for (int i = 1; i < npts; i++) {
+            ep[i] = sext(ep[i], BC6_BITS_DR[mode]);
+            ep[4 + i] = sext(ep[4 + i], BC6_BITS_DG[mode]);
+            ep[8 + i] = sext(ep[8 + i], BC6_BITS_DB[mode]);
+        }
+    }
+    if (mode != 9 && mode != 10) {
+        for (int i = 1; i < npts; i++) {
+            for (int c = 0; c < 3; c++) {
+                int v = (ep[c * 4 + i] + ep[c * 4]) & ((1 << w) - 1);
+                ep[c * 4 + i] = sgn ? sext(v, w) : v;
+            }
+        }
+    }
+    for (int i = 0; i < 12; i++) ep[i] = bc6_unquantize(ep[i], w, sgn);
+    const int w3[8] = int[8](0, 9, 18, 27, 37, 46, 55, 64);
+    const int w4[16] = int[16](0, 4, 9, 13, 17, 21, 26, 30, 34, 38, 43, 47, 51, 55, 60, 64);
+    uint part = BC7_PART2[part_id], anchor = BC7_PART2_ANCHOR[part_id] & 15u;
+    for (uint t = 0u; t < 16u; t++) {
+        uint subset = two ? ((part >> (2u * t)) & 3u) : 0u;
+        uint nb = two ? 3u : 4u;
+        if (t == 0u || (two && subset == 1u && t == anchor)) nb--;
+        uint idx = bits(blk, pos, nb);
+        pos += nb;
+        int wt = two ? w3[idx] : w4[idx];
+        int s2 = int(subset) * 2;
+        uvec3 h;
+        for (int c = 0; c < 3; c++) {
+            int a = ep[c * 4 + s2], b = ep[c * 4 + s2 + 1];
+            h[c] = bc6_finish((a * (64 - wt) + b * wt + 32) >> 6, sgn);
+        }
+        put_half(t & 3u, t >> 2, h);
+    }
+}
+
+/* ------------------------------------------------------------------ BC7 */
+
+void bc7(uvec4 blk)
+{
+    /* the mode is the lowest set bit of the first byte (8: none, an invalid block); found without a
+     * loop, which the Mali-G1-Ultra's r54p1 driver compiled wrong when blocks of different modes
+     * shared a workgroup */
+    uint mode = (blk.x & 0xffu) == 0u ? 8u : uint(findLSB(blk.x & 0xffu));
+#if defined(TRANSCODE)
+    g_bc7_parts = 1u;
+#endif
+    if (mode >= 8u) {
+        for (uint t = 0u; t < 16u; t++) put(t & 3u, t >> 2, vec4(0.0));
+        return;
+    }
+    uint pos = mode + 1u;
+    uint nparts = 1u, part_id = 0u, rotation = 0u, isel = 0u;
+    if (mode == 0u || mode == 1u || mode == 2u || mode == 3u || mode == 7u) {
+        nparts = (mode == 0u || mode == 2u) ? 3u : 2u;
+        uint pb = mode == 0u ? 4u : 6u;
+        part_id = bits(blk, pos, pb);
+        pos += pb;
+    }
+    uint neps = nparts * 2u;
+#if defined(TRANSCODE)
+    g_bc7_parts = nparts;
+    g_bc7_part = part_id;
+#endif
+    if (mode == 4u || mode == 5u) {
+        rotation = bits(blk, pos, 2u);
+        pos += 2u;
+        if (mode == 4u) { isel = bits(blk, pos, 1u); pos += 1u; }
+    }
+    int cb = BC7_BITS_RGB[mode], ab = BC7_BITS_A[mode];
+    uint ep[6][4];
+    for (uint c = 0u; c < 3u; c++)
+        for (uint e = 0u; e < neps; e++) { ep[e][c] = bits(blk, pos, uint(cb)); pos += uint(cb); }
+    for (uint e = 0u; e < neps; e++) {
+        if (ab > 0) { ep[e][3] = bits(blk, pos, uint(ab)); pos += uint(ab); }
+        else ep[e][3] = 0u;
+    }
+    const uint has_pbits = 203u; /* 0b11001011 */
+    bool pbits = ((has_pbits >> mode) & 1u) != 0u || mode == 1u;
+    if (mode == 0u || mode == 1u || mode == 3u || mode == 6u || mode == 7u) {
+        for (uint e = 0u; e < neps; e++)
+            for (uint c = 0u; c < 4u; c++) ep[e][c] <<= 1;
+        if (mode == 1u) {
+            uint p0 = bits(blk, pos, 1u), p1 = bits(blk, pos + 1u, 1u);
+            pos += 2u;
+            for (uint c = 0u; c < 3u; c++) { ep[0][c] |= p0; ep[1][c] |= p0; ep[2][c] |= p1; ep[3][c] |= p1; }
+        } else {
+            for (uint e = 0u; e < neps; e++) {
+                uint p = bits(blk, pos, 1u);
+                pos += 1u;
+                for (uint c = 0u; c < 4u; c++) ep[e][c] |= p;
+            }
+        }
+    }
+    for (uint e = 0u; e < neps; e++) {
+        uint j = uint(cb) + ((has_pbits >> mode) & 1u);
+        for (uint c = 0u; c < 3u; c++) {
+            ep[e][c] = ep[e][c] << (8u - j);
+            ep[e][c] = (ep[e][c] | (ep[e][c] >> j)) & 0xffu;
+        }
+        j = uint(ab) + ((has_pbits >> mode) & 1u);
+        ep[e][3] = ep[e][3] << (8u - j);
+        ep[e][3] = (ep[e][3] | (ep[e][3] >> j)) & 0xffu;
+        if (ab == 0) ep[e][3] = 255u;
+    }
+    const uint w2[4] = uint[4](0u, 21u, 43u, 64u);
+    const uint w3[8] = uint[8](0u, 9u, 18u, 27u, 37u, 46u, 55u, 64u);
+    const uint w4[16] = uint[16](0u, 4u, 9u, 13u, 17u, 21u, 26u, 30u, 34u, 38u, 43u, 47u, 51u, 55u, 60u, 64u);
+    uint ib = (mode == 0u || mode == 1u) ? 3u : (mode == 6u ? 4u : 2u);
+    uint ib2 = mode == 4u ? 3u : (mode == 5u ? 2u : 0u);
+    uint part = nparts == 2u ? BC7_PART2[part_id] : (nparts == 3u ? BC7_PART3[part_id] : 0u);
+#if defined(TRANSCODE)
+    g_bc7_mask = part;
+#endif
+    uint anchors = nparts == 2u ? BC7_PART2_ANCHOR[part_id] : (nparts == 3u ? BC7_PART3_ANCHOR[part_id] : 0u);
+    uint idx1[16];
+    for (uint t = 0u; t < 16u; t++) {
+        uint subset = (part >> (2u * t)) & 3u;
+        uint nb = ib;
+        bool anchor = t == 0u || (subset == 1u && t == (anchors & 15u)) || (subset == 2u && t == (anchors >> 4));
+        if (anchor) nb--;
+        idx1[t] = bits(blk, pos, nb);
+        pos += nb;
+    }
+    for (uint t = 0u; t < 16u; t++) {
+        uint subset = (part >> (2u * t)) & 3u;
+        uint e0 = subset * 2u, e1 = e0 + 1u;
+        uint i1 = idx1[t];
+        uvec4 c;
+        if (ib2 == 0u) {
+            uint wt = ib == 2u ? w2[i1] : (ib == 3u ? w3[i1] : w4[i1]);
+            for (uint k = 0u; k < 4u; k++) c[k] = (ep[e0][k] * (64u - wt) + ep[e1][k] * wt + 32u) >> 6;
+        } else {
+            uint nb2 = t == 0u ? ib2 - 1u : ib2;
+            uint i2 = bits(blk, pos, nb2);
+            pos += nb2;
+            uint wa = ib == 2u ? w2[i1] : w3[i1];
+            uint wb = ib2 == 2u ? w2[i2] : w3[i2];
+            uint wc = isel == 0u ? wa : wb, wal = isel == 0u ? wb : wa;
+            for (uint k = 0u; k < 3u; k++) c[k] = (ep[e0][k] * (64u - wc) + ep[e1][k] * wc + 32u) >> 6;
+            c.w = (ep[e0][3] * (64u - wal) + ep[e1][3] * wal + 32u) >> 6;
+        }
+        if (rotation == 1u) c = c.agbr;
+        else if (rotation == 2u) c = c.rabg;
+        else if (rotation == 3u) c = c.rgab;
+        put(t & 3u, t >> 2, vec4(c) / 255.0);
+    }
+}
+
+/* ------------------------------------------------------------------ main */
+
+/* Texel t, or where it lies past the region's edge (a small mip's), the nearest one inside: the
+ * encoder then fits only what can be seen. */
+uint seen(uint t, uvec2 blk)
+{
+    uvec2 lim = min(pc.extent - blk * 4u, uvec2(4u));
+    return min(t >> 2, lim.y - 1u) * 4u + min(t & 3u, lim.x - 1u);
+}
+
+#if defined(ENC_ASTCN)
+/* ENC_ASTCN: one invocation per ASTC_N x ASTC_N block. Its texels come from the BC blocks under it
+ * (2x2 for 8x8, 2 or 3 a side for 6x6), each decoded into g_px; texels past the region's edges (a
+ * small mip's, or a region that does not start or end on an ASTC block's edge) repeat the nearest
+ * inside, so the encoder fits what can be seen. */
+void decode_rgba(uvec4 b)
+{
+#if defined(FMT_BC1)
+    uvec4 tex[16];
+    color_block(b.x, b.y, false, tex);
+    for (uint t = 0u; t < 16u; t++) {
+        uvec4 c = tex[t];
+        if ((pc.flags & 1u) != 0u) c.w = 255u;
+        put(t & 3u, t >> 2, vec4(c) / 255.0);
+    }
+#elif defined(FMT_BC2) || defined(FMT_BC3)
+    uvec4 tex[16];
+    color_block(b.z, b.w, true, tex);
+    uint a[16];
+#if defined(FMT_BC2)
+    for (uint t = 0u; t < 16u; t++) a[t] = bits(b, 4u * t, 4u) * 17u;
+#else
+    smooth_alpha(b.x, b.y, a);
+#endif
+    for (uint t = 0u; t < 16u; t++) put(t & 3u, t >> 2, vec4(tex[t].rgb, a[t]) / 255.0);
+#elif defined(FMT_BC7)
+    bc7(b);
+#endif
+}
+
 void main()
 {
-    uint local_pixel = gl_GlobalInvocationID.x;
-    if (local_pixel >= r.chunk_pixels) return;
-    uint pixel = r.first_pixel + local_pixel;
-    if (pixel >= r.pixels) return;
-    if (r.mode >= 12) {
-        // Two RGB16F texels occupy three words. One invocation owns the pair,
-        // including across row/layer boundaries; the last halfword is padded.
-        if ((pixel & 1) != 0) return;
-        uvec2 a = bc6_texel(pixel), b = uvec2(0);
-        bool second = pixel + 1 < r.pixels;
-        if (second) b = bc6_texel(pixel + 1);
-        uint at = r.destination_word + (pixel / 2) * 3;
-        dst.data[at] = a.x;
-        dst.data[at + 1] = (a.y & 65535u) | (b.x << 16);
-        if (second) dst.data[at + 2] = (b.x >> 16) | (b.y << 16);
-        return;
-    }
-    if (r.mode == 8) {
-        // Four RGB texels occupy three storage words. Only their first
-        // invocation writes, so odd rows/layers never race at byte boundaries.
-        if ((pixel & 3) != 0) return;
-        uint count = min(r.pixels - pixel, 4);
-        uvec4 colors = uvec4(0);
-        for (uint i = 0; i < count; ++i) colors[i] = rgb8_texel(pixel + i);
-        uint at = r.destination_word + (pixel / 4) * 3;
-        dst.data[at] = colors[0] | (colors[1] << 24);
-        if (count >= 2) dst.data[at + 1] = (colors[1] >> 8) | (colors[2] << 16);
-        if (count >= 3) dst.data[at + 2] = (colors[2] >> 16) | (colors[3] << 8);
-        return;
-    }
-    uint x = pixel % r.width;
-    uint y = (pixel / r.width) % r.height;
-    uint layer = pixel / (r.width * r.height);
-    uint block = layer * r.layer_blocks + (y / 4) * r.row_blocks + x / 4;
-    uint word = r.source_word + block * (r.mode < 2 || r.mode == 4 || r.mode == 5 ? 2 : 4);
-    uint within = (y & 3) * 4 + (x & 3);
-    if (r.mode >= 10) {
-        uvec2 decoded = bc6_rgba16(
-            uvec4(src.data[word], src.data[word + 1], src.data[word + 2], src.data[word + 3]), within, r.mode == 11);
-        dst.data[r.destination_word + 2 * pixel] = decoded.x;
-        dst.data[r.destination_word + 2 * pixel + 1] = decoded.y;
-        return;
-    }
-    if (r.mode == 9) {
-        dst.data[r.destination_word + pixel] = bc7_rgba(
-            uvec4(src.data[word], src.data[word + 1], src.data[word + 2], src.data[word + 3]), within);
-        return;
-    }
-    if (r.mode >= 4) {
-        bool snorm = (r.mode & 1) != 0;
-        // BC4 is a single-component R16 image. Pack two texels per storage
-        // word, including across row/layer boundaries; never race halfword
-        // writes. Dispatch chunks start at multiples of 64 pixels.
-        if (r.mode < 6 && (pixel & 1) != 0) return;
-        uint red = channel16(word, within, snorm);
-        uint other = 0;
-        if (r.mode >= 6) other = channel16(word + 2, within, snorm);
-        else if (pixel + 1 < r.pixels) {
-            uint next = pixel + 1;
-            uint nx = next % r.width, ny = (next / r.width) % r.height;
-            uint nl = next / (r.width * r.height);
-            uint nb = nl * r.layer_blocks + (ny / 4) * r.row_blocks + nx / 4;
-            other = channel16(r.source_word + nb * 2, (ny & 3) * 4 + (nx & 3), snorm);
+    const uint N = uint(ASTC_N);
+    uvec2 ab = gl_GlobalInvocationID.xy;
+    uvec2 nab = (pc.extent + N - 1u) / N;
+    if (ab.x >= nab.x || ab.y >= nab.y) return;
+#if defined(FMT_BC1)
+    uint words = 2u;
+#else
+    uint words = 4u;
+#endif
+    uint sx = pc.nx.x & 15u, sy = (pc.nx.x >> 4) & 15u, r0 = pc.nx.x >> 8;
+    /* this block's texels inside the piece, and where they come from in the region */
+    uvec2 lim = min(pc.extent - ab * N, uvec2(N));
+    uint u0 = ab.x * N, v0 = pc.nx.y + ab.y * N;
+    uvec2 smin = uvec2(u0 > sx ? u0 - sx : 0u, v0 > sy ? v0 - sy : 0u);
+    uvec2 smax = min(uvec2(u0 + lim.x - 1u, v0 + lim.y - 1u), uvec2(sx, sy) + pc.nx.zw - 1u);
+    smax = uvec2(smax.x > sx ? smax.x - sx : 0u, smax.y > sy ? smax.y - sy : 0u);
+    smin = min(smin, smax);
+    for (uint by = smin.y / 4u; by <= smax.y / 4u; by++)
+        for (uint bx = smin.x / 4u; bx <= smax.x / 4u; bx++) {
+            uint base = pc.src_word + (gl_GlobalInvocationID.z * pc.layer_blocks + (by - r0) * pc.row_blocks + bx) * words;
+            decode_rgba(uvec4(src.w[base], src.w[base + 1u], words > 2u ? src.w[base + 2u] : 0u, words > 2u ? src.w[base + 3u] : 0u));
+            for (uint j = 0u; j < N; j++)
+                for (uint i = 0u; i < N; i++) {
+                    uint u = u0 + min(i, lim.x - 1u), v = v0 + min(j, lim.y - 1u);
+                    uvec2 s = clamp(uvec2(u > sx ? u - sx : 0u, v > sy ? v - sy : 0u), smin, smax);
+                    if (s.x / 4u == bx && s.y / 4u == by) {
+                        ivec4 c = g_px[(s.y & 3u) * 4u + (s.x & 3u)];
+                        g_bpx[j * N + i] = uint(c.r) | (uint(c.g) << 8) | (uint(c.b) << 16) | (uint(c.a) << 24);
+                    }
+                }
         }
-        uint destination = r.mode < 6 ? pixel / 2 : pixel;
-        dst.data[r.destination_word + destination] = red | (other << 16);
-        return;
-    }
-    uint color_word = word + (r.mode < 2 ? 0 : 2);
-    uint rgba = color_rgba(color_word, within, r.mode);
-    uint alpha = rgba >> 24;
-    if (r.mode == 2)
-        alpha = ((src.data[word + within / 8] >> ((within & 7) * 4)) & 15) * 17;
-    else if (r.mode == 3) alpha = alpha3(word, within);
-    // sRGB variants retain encoded bytes; image sampling performs the EOTF.
-    dst.data[r.destination_word + pixel] = (rgba & 0xffffff) | (alpha << 24);
+    uvec4 enc = astcn_encode();
+    uint o = pc.dst_word + ((gl_GlobalInvocationID.z * nab.y + ab.y) * nab.x + ab.x) * 4u;
+    for (uint k = 0u; k < 4u; k++) dst.w[o + k] = enc[k];
 }
+#else
+void main()
+{
+    uvec2 blk = gl_GlobalInvocationID.xy;
+    uvec2 nblk = (pc.extent + 3u) / 4u;
+    if (blk.x >= nblk.x || blk.y >= nblk.y) return;
+#if defined(FMT_BC1) || defined(FMT_BC4)
+    uint words = 2u;
+#else
+    uint words = 4u;
+#endif
+#if !defined(TRANSCODE)
+    for (uint i = 0u; i < 4u * ROW_WORDS; i++) outw[i] = 0u;
+#endif
+    uint base = pc.src_word + (gl_GlobalInvocationID.z * pc.layer_blocks + blk.y * pc.row_blocks + blk.x) * words;
+    uvec4 b = uvec4(src.w[base], src.w[base + 1u], words > 2u ? src.w[base + 2u] : 0u, words > 2u ? src.w[base + 3u] : 0u);
+    bool sgn = (pc.flags & 2u) != 0u;
+#if defined(FMT_BC1)
+    uvec4 tex[16];
+    color_block(b.x, b.y, false, tex);
+    for (uint t = 0u; t < 16u; t++) {
+        uvec4 c = tex[t];
+        if ((pc.flags & 1u) != 0u) c.w = 255u;
+        put(t & 3u, t >> 2, vec4(c) / 255.0);
+    }
+#elif defined(FMT_BC2) || defined(FMT_BC3)
+    uvec4 tex[16];
+    color_block(b.z, b.w, true, tex);
+    uint a[16];
+#if defined(FMT_BC2)
+    for (uint t = 0u; t < 16u; t++) a[t] = bits(b, 4u * t, 4u) * 17u;
+#else
+    smooth_alpha(b.x, b.y, a);
+#endif
+    for (uint t = 0u; t < 16u; t++) put(t & 3u, t >> 2, vec4(tex[t].rgb, a[t]) / 255.0);
+#elif defined(FMT_BC4) && defined(ENC_EAC)
+    float v[16];
+    bc4_exact(b.x, b.y, sgn, v);
+    for (uint t = 0u; t < 16u; t++) v[t] = v[seen(t, blk)];
+    uvec4 enc = uvec4(eac_encode(v, sgn), 0u, 0u);
+#elif defined(FMT_BC5) && defined(ENC_EAC)
+    float r[16], g[16];
+    bc4_exact(b.x, b.y, sgn, r);
+    bc4_exact(b.z, b.w, sgn, g);
+    for (uint t = 0u; t < 16u; t++) {
+        r[t] = r[seen(t, blk)];
+        g[t] = g[seen(t, blk)];
+    }
+    uvec4 enc = uvec4(eac_encode(r, sgn), eac_encode(g, sgn));
+#elif defined(FMT_BC4)
+    float v[16];
+    bc4_exact(b.x, b.y, sgn, v);
+    for (uint t = 0u; t < 16u; t++) put(t & 3u, t >> 2, vec4(v[t] / (sgn ? 1023.0 : 2047.0), 0.0, 0.0, 1.0));
+#elif defined(FMT_BC5)
+    float r[16], g[16];
+    bc4_exact(b.x, b.y, sgn, r);
+    bc4_exact(b.z, b.w, sgn, g);
+    for (uint t = 0u; t < 16u; t++) put(t & 3u, t >> 2, vec4(vec2(r[t], g[t]) / (sgn ? 1023.0 : 2047.0), 0.0, 1.0));
+#elif defined(FMT_BC6H)
+    bc6h(b, sgn);
+#elif defined(FMT_BC7)
+    bc7(b);
+#endif
+#if defined(ENC_ASTC_HDR)
+    for (uint t = 0u; t < 16u; t++) g_hpx[t] = g_hpx[seen(t, blk)];
+#elif defined(TRANSCODE) && !defined(ENC_EAC)
+    for (uint t = 0u; t < 16u; t++) g_px[t] = g_px[seen(t, blk)];
+#endif
+#if defined(TRANSCODE)
+#if defined(ENC_ETC2)
+    uvec4 enc = uvec4(etc2_encode((pc.flags & 4u) != 0u), 0u, 0u);
+#elif defined(ENC_ASTC) && defined(FMT_BC7)
+    /* BC7's partition, as the nearest ASTC one; of 3 subsets, the two closest in colour merged (one
+     * lookup: a table indexed at run time may be copied whole each time) */
+    uint part = ~0u;
+    if (g_bc7_parts > 1u) {
+        uint i = g_bc7_part;
+        if (g_bc7_parts == 3u) {
+            vec3 sum[3] = vec3[3](vec3(0.0), vec3(0.0), vec3(0.0));
+            float n[3] = float[3](0.0, 0.0, 0.0);
+            for (uint t = 0u; t < 16u; t++) {
+                uint k = (g_bc7_mask >> (2u * t)) & 3u;
+                sum[k] += vec3(g_px[t].rgb);
+                n[k] += 1.0;
+            }
+            for (uint k = 0u; k < 3u; k++) sum[k] /= max(n[k], 1.0);
+            float d01 = distance(sum[0], sum[1]), d02 = distance(sum[0], sum[2]), d12 = distance(sum[1], sum[2]);
+            uint alone = d01 <= d02 && d01 <= d12 ? 2u : (d02 <= d12 ? 1u : 0u);
+            i = 64u + g_bc7_part * 3u + alone;
+        }
+        part = ASTC_BC7P[i];
+    }
+    uvec4 enc = astc_encode(part, true);
+#elif defined(ENC_ASTC_HDR)
+    uvec4 enc = astc_hdr_encode();
+#elif defined(ENC_ASTC)
+    uvec4 enc = astc_encode(~0u, false);
+#endif
+#if defined(ENC_ASTC) || defined(ENC_ASTC_HDR) || defined(FMT_BC5)
+    const uint ow = 4u;
+#else
+    const uint ow = 2u;
+#endif
+    uint o = pc.dst_word + ((gl_GlobalInvocationID.z * nblk.y + blk.y) * nblk.x + blk.x) * ow;
+    for (uint k = 0u; k < ow; k++) dst.w[o + k] = enc[k];
+#else
+    uint row = nblk.x * ROW_WORDS;
+    uint o = pc.dst_word + (gl_GlobalInvocationID.z * nblk.y * 4u + blk.y * 4u) * row + blk.x * ROW_WORDS;
+    for (uint ty = 0u; ty < 4u; ty++)
+        for (uint k = 0u; k < ROW_WORDS; k++) dst.w[o + ty * row + k] = outw[ty * ROW_WORDS + k];
+#endif
+}
+#endif

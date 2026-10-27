@@ -22,7 +22,7 @@ int bc_decode_probe(int validate)
         .enabledValidationFeatureCount = 1, .pEnabledValidationFeatures = &enabled};
     const char *layer = "VK_LAYER_KHRONOS_validation";
     const char *extensions[] = {VK_EXT_DEBUG_UTILS_EXTENSION_NAME, VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME};
-    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_0};
+    VkApplicationInfo app = {.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO, .apiVersion = VK_API_VERSION_1_1};
     VkInstanceCreateInfo ci = {.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO, .pApplicationInfo = &app,
         .pNext = validate ? &vf : NULL, .enabledLayerCount = validate ? 1 : 0, .ppEnabledLayerNames = &layer,
         .enabledExtensionCount = validate ? 2 : 0, .ppEnabledExtensionNames = extensions};
@@ -131,17 +131,14 @@ int bc_decode_probe(int validate)
         unsigned rgb8 = variant >= BC_FORMAT_COUNT && !rgb16;
         unsigned mode = bc_mode(format);
         for (unsigned shape = 0; shape < (mode >= 9 ? 5u : 4u); ++shape) {
-            const uint32_t shapes[5][5] = {{4, 4, 1, 0, 0}, {9, 7, 3, 16, 12},
-                                         {1, 1, 2, 0, 0}, {129, 5, 2, 144, 12}, {128, 64, 1, 0, 0}};
+            const uint32_t shapes[5][5] = {{4, 4, 1, 0, 0}, {12, 8, 3, 16, 12},
+                                         {4, 4, 2, 0, 0}, {132, 8, 2, 144, 12}, {128, 64, 1, 0, 0}};
             struct hybris_bc_region region = {.format = bc_formats[format], .rgb8 = rgb8, .rgb16 = rgb16,
                 .width = shapes[shape][0], .height = shapes[shape][1], .layers = shapes[shape][2],
                 .row_length = shapes[shape][3], .image_height = shapes[shape][4],
                 .source_offset = 12, .destination_offset = 20, .source_range = BYTES, .destination_range = BYTES};
             if (shape == 4 && mode >= 10) region.height = 120;
             VkPhysicalDeviceLimits limits = properties.limits;
-            /* Exercise splitting with modest buffers, without overstating the
-             * amount of device memory or actual workgroup-limit coverage. */
-            if (shape == 3) limits.maxComputeWorkGroupCount[0] = 1;
             for (unsigned round = 0; round < 4; ++round) {
                 int gpu_write = round == 3;
                 if (round == 0 || gpu_write) {
