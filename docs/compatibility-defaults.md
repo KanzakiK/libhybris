@@ -14,6 +14,7 @@ Native format support takes precedence; forced emulation remains opt-in.
 | HYBRIS_VULKAN_COMPAT_POINT_SIZE | 1 | 0 |
 | HYBRIS_VULKAN_COMPAT_INOUT | 1 | 0 |
 | HYBRIS_VULKAN_COMPAT_VERTEX_STORES | 1, restricted to the inspected driver | 0 |
+| HYBRIS_MALI_SPIRV_FIX | 1, restricted to Arm's proprietary Vulkan driver | 0 |
 | HYBRIS_MALI_MMUD_SKIP_LOADER_CHECK | 1, restricted to the matching driver build | 0 |
 
 The format/shader switches above remain disabled during secure execution. Existing
@@ -25,6 +26,13 @@ are not enabled by this policy.
 Default enablement is not a conformance claim. The former image-bounds rewrite
 was removed: proximity to an image instruction does not prove that a conditional
 select checks image bounds. It corrupted Hell Clock's material calculations.
+
+The Mali SPIR-V fix redeclares constant composites that depend on
+specialization constants as specialization composites. DXVK 1.7.3 and later
+use that shape to guard texture reads; Arm's compiler can otherwise fold the
+guard at its defaults and sample black. `HYBRIS_MALI_SPIRV_FIX=force` selects
+the rewrite for controlled non-Mali comparisons.
+
 Unused-builtins cleanup is module-local and can affect cross-stage interface
 matching. BC fallback and packed/instanced vertex conversion still have
 limitations recorded in the baseline evidence; the expanded nonzero

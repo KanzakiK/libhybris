@@ -15,11 +15,14 @@
 #include "vertex_stores.h"
 #include "polygon_pipeline.h"
 #include "bc_context.h"
+#include "spirv_mali.h"
 #include "../layer/layer.h"
+#include <stdint.h>
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/auxv.h>
 
 
 struct shader {
@@ -45,6 +48,8 @@ struct shader_device {
     int cull;
     int vertex_stores;
     int polygon;
+    int mali_spirv;
+    _Atomic unsigned mali_spec_changes;
     VkAllocationCallbacks allocator;
     int custom;
     struct shader *shaders;
@@ -53,10 +58,64 @@ struct shader_device {
 static pthread_mutex_t guard = PTHREAD_MUTEX_INITIALIZER;
 static struct shader_device *devices;
 static _Atomic unsigned point_reports;
+static pthread_once_t mali_spirv_once = PTHREAD_ONCE_INIT;
+static int mali_spirv_enabled;
+
+static void configure_mali_spirv(void)
+{
+    if (getauxval(AT_SECURE))
+        return;
+    const char *value = getenv("HYBRIS_MALI_SPIRV_FIX");
+    mali_spirv_enabled = !value || strcmp(value, "0");
+}
+
+static int hybris_mali_spirv_enabled(void)
+{
+    pthread_once(&mali_spirv_once, configure_mali_spirv);
+    return mali_spirv_enabled;
+}
+
+static int hybris_mali_spirv_driver(VkPhysicalDevice physical)
+{
+    if (!hybris_mali_spirv_enabled())
+        return 0;
+    const char *value = getenv("HYBRIS_MALI_SPIRV_FIX");
+    if (value && !strcmp(value, "force"))
+        return 1;
+
+    struct hybris_layer_physical owner;
+    if (!hybris_layer_lookup_physical(physical, &owner))
+        return 0;
+    PFN_vkGetPhysicalDeviceProperties2 properties2 = (PFN_vkGetPhysicalDeviceProperties2)
+        owner.resolver(owner.instance, "vkGetPhysicalDeviceProperties2");
+    if (properties2) {
+        VkPhysicalDeviceDriverProperties driver = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES,
+        };
+        VkPhysicalDeviceProperties2 properties = {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,
+            .pNext = &driver,
+        };
+        properties2(physical, &properties);
+        if (driver.driverID == VK_DRIVER_ID_ARM_PROPRIETARY)
+            return 1;
+        if (driver.driverID == VK_DRIVER_ID_MESA_PANVK)
+            return 0;
+    }
+
+    PFN_vkGetPhysicalDeviceProperties properties = (PFN_vkGetPhysicalDeviceProperties)
+        owner.resolver(owner.instance, "vkGetPhysicalDeviceProperties");
+    if (!properties)
+        return 0;
+    VkPhysicalDeviceProperties native;
+    properties(physical, &native);
+    return native.vendorID == 0x13b5;
+}
+
 int hybris_shader_enabled(void)
 {
     return hybris_scaled_enabled() || hybris_point_size_enabled() ||
-        hybris_inout_enabled() || hybris_clip_enabled();
+        hybris_inout_enabled() || hybris_clip_enabled() || hybris_mali_spirv_enabled();
 }
 static struct shader_device *find_device(VkDevice handle)
 {
@@ -115,6 +174,7 @@ VkResult hybris_shader_device_create(VkDevice handle, VkPhysicalDevice physical,
     device->clip = hybris_clip_active(physical);
     device->cull = hybris_cull_active(physical);
     device->vertex_stores = hybris_vertex_stores_active(physical);
+    device->mali_spirv = hybris_mali_spirv_driver(physical);
     pthread_mutex_lock(&guard);
     device->next = devices;
     devices = device;
@@ -141,6 +201,9 @@ void hybris_shader_device_destroy(VkDevice handle)
         device->shaders = shader->next;
         free_shader(shader);
     }
+    if (device->mali_spec_changes)
+        fprintf(stderr, "HYBRIS_MALI_SPIRV_DXVK device=%p changes=%u\n",
+            (void *)handle, device->mali_spec_changes);
     hybris_scaled_free(device->custom ? &device->allocator : NULL, device);
 }
 static VkResult VKAPI_CALL create_shader(VkDevice handle, const VkShaderModuleCreateInfo *info,
@@ -149,7 +212,8 @@ static VkResult VKAPI_CALL create_shader(VkDevice handle, const VkShaderModuleCr
     struct shader_device *device = find_device(handle);
     if (!device) return VK_ERROR_INITIALIZATION_FAILED;
     if (!device->mask && !device->point_size && !device->inout &&
-        !device->clip && !device->cull && !device->vertex_stores && !device->polygon)
+        !device->clip && !device->cull && !device->vertex_stores &&
+        !device->polygon && !device->mali_spirv)
         return device->create_shader(handle, info, allocator, module);
     struct shader *shader = hybris_scaled_alloc(allocator, sizeof(*shader), VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
     if (!shader) return VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -162,6 +226,16 @@ static VkResult VKAPI_CALL create_shader(VkDevice handle, const VkShaderModuleCr
     shader->extensions = info->pNext != NULL;
     memcpy(shader->code, info->pCode, info->codeSize);
     VkShaderModuleCreateInfo created = *info;
+    if (device->mali_spirv) {
+        unsigned changed = hybris_spirv_mali_spec_constants(shader->code, shader->size);
+        if (changed) {
+            created.pCode = shader->code;
+            created.codeSize = shader->size;
+            unsigned before = atomic_fetch_add(&device->mali_spec_changes, changed);
+            if (!before)
+                fprintf(stderr, "HYBRIS_MALI_SPIRV_DXVK spec-constant composites redeclared\n");
+        }
+    }
     VkResult result = VK_SUCCESS;
     uint32_t *cleaned = NULL;
     size_t cleaned_size = 0;
