@@ -66,7 +66,8 @@ static VkResult VKAPI_CALL enumerate_device_extensions(VkPhysicalDevice physical
     unsigned bc_mask = layer ? 0 : hybris_bc_physical_mask(physical);
     unsigned shader_mask = layer ? 0 : hybris_shader_physical_mask(physical);
     int vertex_stores = !layer && hybris_vertex_stores_active(physical);
-    if (layer || (!bc_mask && !shader_mask && !vertex_stores))
+    int robustness2 = !layer && hybris_shader_robustness2_access_emulated(physical);
+    if (layer || (!bc_mask && !shader_mask && !vertex_stores && !robustness2))
         return enumerate(physical, layer, count, properties);
     uint32_t available = 0;
     VkResult result = enumerate(physical, NULL, &available, NULL);
@@ -76,13 +77,24 @@ static VkResult VKAPI_CALL enumerate_device_extensions(VkPhysicalDevice physical
     result = enumerate(physical, NULL, &available, all);
     if (result != VK_SUCCESS && result != VK_INCOMPLETE) { free(all); return result; }
     uint32_t kept = 0, written = 0, capacity = properties ? *count : 0;
+    int has_robustness2 = 0;
     for (uint32_t i = 0; i < available; ++i) {
+        has_robustness2 |= !strcmp(all[i].extensionName, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME) ||
+            !strcmp(all[i].extensionName, VK_KHR_ROBUSTNESS_2_EXTENSION_NAME);
         if ((bc_mask && !hybris_bc_extension_allowed(all[i].extensionName)) ||
             ((shader_mask || vertex_stores) && !hybris_shader_extension_allowed(all[i].extensionName))) continue;
         if (properties && written < capacity) properties[written++] = all[i];
         ++kept;
     }
     free(all);
+    if (robustness2 && !has_robustness2) {
+        VkExtensionProperties compat = {
+            .extensionName = VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+            .specVersion = 1,
+        };
+        if (properties && written < capacity) properties[written++] = compat;
+        ++kept;
+    }
     *count = properties ? written : kept;
     return properties && written < kept ? VK_INCOMPLETE : VK_SUCCESS;
 }

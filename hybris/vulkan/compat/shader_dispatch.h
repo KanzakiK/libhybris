@@ -14,4 +14,6 @@ PFN_vkVoidFunction hybris_shader_proc(const char *name);
 int hybris_shader_device_proc_allowed(VkDevice device, const char *name);
 int hybris_shader_polygon_active(VkDevice device);
 int hybris_shader_polygon_emulated(VkPhysicalDevice physical);
+int hybris_shader_multi_viewport_emulated(VkPhysicalDevice physical);
+int hybris_shader_robustness2_access_emulated(VkPhysicalDevice physical);
 #endif

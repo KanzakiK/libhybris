@@ -65,6 +65,7 @@ static void VKAPI_CALL features(VkPhysicalDevice physical,VkPhysicalDeviceFeatur
     if(!query) query=(void*)context.resolver(context.instance,"vkGetPhysicalDeviceFeatures");
     query(physical,out);
     if(hybris_shader_polygon_emulated(physical)) out->fillModeNonSolid=VK_TRUE;
+    if(hybris_shader_multi_viewport_emulated(physical)) out->multiViewport=VK_TRUE;
 }
 static void features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *out, const char *name)
 {
@@ -77,7 +78,11 @@ static void features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *out,
     query(physical, out);
     int polygon=hybris_shader_polygon_emulated(physical);
     if(polygon) out->features.fillModeNonSolid=VK_TRUE;
-    if (!hybris_shader_physical_mask(physical) && !hybris_vertex_stores_active(physical) && !polygon) return;
+    int multi_viewport=hybris_shader_multi_viewport_emulated(physical);
+    if(multi_viewport) out->features.multiViewport=VK_TRUE;
+    int robustness2=hybris_shader_robustness2_access_emulated(physical);
+    if (!hybris_shader_physical_mask(physical) && !hybris_vertex_stores_active(physical) &&
+        !polygon && !multi_viewport && !robustness2) return;
     for (VkBaseOutStructure *node = out->pNext; node; node = node->pNext) {
         switch (node->sType) {
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_INPUT_DYNAMIC_STATE_FEATURES_EXT:
@@ -88,6 +93,15 @@ static void features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *out,
             break;
         case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_OBJECT_FEATURES_EXT:
             ((VkPhysicalDeviceShaderObjectFeaturesEXT *)node)->shaderObject = VK_FALSE;
+            break;
+        case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT:
+            {
+                VkPhysicalDeviceRobustness2FeaturesEXT *features=(void*)node;
+                features->robustBufferAccess2=VK_TRUE;
+                features->robustImageAccess2=VK_TRUE;
+                features->nullDescriptor=VK_TRUE;
+                fprintf(stderr, "HYBRIS_ROBUSTNESS2_EMULATED advertised=1\n");
+            }
             break;
         default: break;
         }

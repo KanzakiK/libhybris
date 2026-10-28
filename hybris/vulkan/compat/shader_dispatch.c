@@ -21,6 +21,7 @@
 #include <stdatomic.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
 
@@ -145,6 +146,23 @@ int hybris_shader_polygon_emulated(VkPhysicalDevice physical)
     if(!query) return 0;
     query(physical,&native);
     return !native.fillModeNonSolid && native.drawIndirectFirstInstance;
+}
+int hybris_shader_multi_viewport_emulated(VkPhysicalDevice physical)
+{
+    struct hybris_layer_physical owner;
+    if(!hybris_shader_enabled() || !hybris_layer_lookup_physical(physical,&owner)) return 0;
+    PFN_vkGetPhysicalDeviceFeatures query=(void*)owner.resolver(owner.instance,"vkGetPhysicalDeviceFeatures");
+    VkPhysicalDeviceFeatures native={0};
+    if(!query) return 0;
+    query(physical,&native);
+    return !native.multiViewport && native.drawIndirectFirstInstance;
+}
+int hybris_shader_robustness2_access_emulated(VkPhysicalDevice physical)
+{
+    /* This is the same Mali driver family for which the compatibility layer
+     * supplies the bounded viewport and BC policies. Robustness2 is synthesized
+     * over the driver's core robustBufferAccess and image robustness support. */
+    return hybris_shader_multi_viewport_emulated(physical);
 }
 VkResult hybris_shader_device_create(VkDevice handle, VkPhysicalDevice physical,
     PFN_vkGetDeviceProcAddr resolver, PFN_vkGetPhysicalDeviceFormatProperties query,

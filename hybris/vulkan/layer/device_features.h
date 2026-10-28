@@ -5,6 +5,7 @@
 struct hybris_device_features {
     VkDeviceCreateInfo info;
     VkPhysicalDeviceFeatures features;
+    const char **extensions;
     VkBaseOutStructure *copies;
     const void *suffix;
 };

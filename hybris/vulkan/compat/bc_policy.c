@@ -4,6 +4,7 @@
 #include "bc_policy.h"
 #include "bc_context.h"
 #include "../layer/layer.h"
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
@@ -11,6 +12,7 @@
 
 static pthread_once_t policy_once = PTHREAD_ONCE_INIT;
 static int policy;
+static atomic_uint feature_report;
 static void initialize_policy(void)
 {
     if (getauxval(AT_SECURE)) return;
@@ -224,9 +226,8 @@ VkResult hybris_bc_prepare_device(VkPhysicalDevice physical, const VkDeviceCreat
     if (!hybris_bc_physical_mask(physical)) return VK_SUCCESS;
     for (uint32_t i = 0; i < info->enabledExtensionCount; ++i)
         if (!hybris_bc_extension_allowed(info->ppEnabledExtensionNames[i])) return VK_ERROR_EXTENSION_NOT_PRESENT;
-    int complete = hybris_bc_complete(physical);
-    if (info->pEnabledFeatures && (info->pEnabledFeatures->pipelineStatisticsQuery ||
-        (info->pEnabledFeatures->textureCompressionBC && !complete))) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (info->pEnabledFeatures && info->pEnabledFeatures->pipelineStatisticsQuery)
+        return VK_ERROR_FEATURE_NOT_PRESENT;
     for (const VkBaseInStructure *node = info->pNext; node; node = node->pNext) {
         unsigned count = unsupported_feature_count(node->sType);
         for (unsigned i = 0; i < count; ++i) {
@@ -237,8 +238,8 @@ VkResult hybris_bc_prepare_device(VkPhysicalDevice physical, const VkDeviceCreat
         if (node->sType == VK_STRUCTURE_TYPE_DEVICE_GROUP_DEVICE_CREATE_INFO &&
             ((const VkDeviceGroupDeviceCreateInfo *)node)->physicalDeviceCount != 1) return VK_ERROR_FEATURE_NOT_PRESENT;
         if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2 &&
-            (((const VkPhysicalDeviceFeatures2 *)node)->features.pipelineStatisticsQuery ||
-             (((const VkPhysicalDeviceFeatures2 *)node)->features.textureCompressionBC && !complete))) return VK_ERROR_FEATURE_NOT_PRESENT;
+            ((const VkPhysicalDeviceFeatures2 *)node)->features.pipelineStatisticsQuery)
+            return VK_ERROR_FEATURE_NOT_PRESENT;
         if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES &&
             ((const VkPhysicalDeviceVulkan11Features *)node)->protectedMemory) return VK_ERROR_FEATURE_NOT_PRESENT;
         if (node->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROTECTED_MEMORY_FEATURES &&
@@ -293,9 +294,13 @@ static void VKAPI_CALL features(VkPhysicalDevice physical, VkPhysicalDeviceFeatu
     if (!hybris_layer_lookup_physical(physical, &context)) return;
     PHYSICAL_PROC(GetPhysicalDeviceFeatures);
     GetPhysicalDeviceFeatures(physical, out);
-    if (hybris_bc_physical_mask(physical)) {
+    unsigned mask = hybris_bc_physical_mask(physical);
+    if (mask) {
         out->pipelineStatisticsQuery = VK_FALSE;
-        out->textureCompressionBC = hybris_bc_complete(physical);
+        out->textureCompressionBC = VK_TRUE;
+        if (!atomic_fetch_or(&feature_report, 1))
+            fprintf(stderr, "HYBRIS_BC_FEATURE mask=0x%x complete=%d advertised=1\n",
+                mask, hybris_bc_complete(physical));
     }
 }
 static void features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *out, const char *name)
@@ -304,9 +309,13 @@ static void features2(VkPhysicalDevice physical, VkPhysicalDeviceFeatures2 *out,
     if (!hybris_layer_lookup_physical(physical, &context)) return;
     PFN_vkGetPhysicalDeviceFeatures2 query = (PFN_vkGetPhysicalDeviceFeatures2)context.resolver(context.instance, name);
     query(physical, out);
-    if (!hybris_bc_physical_mask(physical)) return;
+    unsigned mask = hybris_bc_physical_mask(physical);
+    if (!mask) return;
     out->features.pipelineStatisticsQuery = VK_FALSE;
-    out->features.textureCompressionBC = hybris_bc_complete(physical);
+    out->features.textureCompressionBC = VK_TRUE;
+    if (!atomic_fetch_or(&feature_report, 1))
+        fprintf(stderr, "HYBRIS_BC_FEATURE mask=0x%x complete=%d advertised=1\n",
+            mask, hybris_bc_complete(physical));
     for (VkBaseOutStructure *node = out->pNext; node; node = node->pNext) {
         unsigned count = unsupported_feature_count(node->sType);
         if (count) memset((char *)node + sizeof(VkBaseOutStructure), 0, count * sizeof(VkBool32));
