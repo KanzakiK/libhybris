@@ -31,6 +31,10 @@ def main():
             target = stage / subdir / path.relative_to(source / subdir)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(path, target)
+            if target.suffix != '.json':
+                data = target.read_bytes()
+                if b'\r\n' in data:
+                    target.write_bytes(data.replace(b'\r\n', b'\n'))
     # Correct the HAL's float-control capability at the shared Vulkan layer.
     # Applications such as DXVK then use the ordinary capability query path.
     patch = component / 'libhybris-adreno-float-properties.patch'
