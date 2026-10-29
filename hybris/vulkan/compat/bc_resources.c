@@ -237,7 +237,17 @@ static VkResult VKAPI_CALL create_view(VkDevice handle, const VkImageViewCreateI
             hybris_bc_image_format(info->format, 0) : resource->emulated.decoded_format;
     }
     PROC(CreateImageView);
-    return CreateImageView(handle, &translated, allocator, view);
+    VkResult result = CreateImageView(handle, &translated, allocator, view);
+    const char *trace = getauxval(AT_SECURE) ? NULL : getenv("HYBRIS_VULKAN_TRACE");
+    if (resource && resource->emulated.image && trace && !strcmp(trace, "1"))
+        fprintf(stderr,
+            "HYBRIS_BC_VIEW image=%p requested=%u translated=%u type=%u "
+            "aspect=0x%x mip=%u mips=%u layer=%u layers=%u result=%d\n",
+            (void *)info->image, info->format, translated.format, info->viewType,
+            info->subresourceRange.aspectMask, info->subresourceRange.baseMipLevel,
+            info->subresourceRange.levelCount, info->subresourceRange.baseArrayLayer,
+            info->subresourceRange.layerCount, result);
+    return result;
 }
 /* Only the prefix leading to a dedicated-image node needs copying. The tail
  * is passed unchanged, and no application-owned pNext memory is modified. */

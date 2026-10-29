@@ -1,10 +1,26 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 #define VK_NO_PROTOTYPES
 #include "bc_transfer.h"
+#include <pthread.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/auxv.h>
 
 #define PROC(name) PFN_vk##name name = (PFN_vk##name)t->decoder->resolver(t->decoder->device, "vk" #name)
+static pthread_once_t fast_once = PTHREAD_ONCE_INIT;
+static int fast_policy = 1;
+static void initialize_fast_policy(void)
+{
+    if (getauxval(AT_SECURE)) return;
+    const char *value = getenv("HYBRIS_BC_FAST");
+    if (value && !strcmp(value, "0")) fast_policy = 0;
+}
+static int fast_enabled(void)
+{
+    pthread_once(&fast_once, initialize_fast_policy);
+    return fast_policy;
+}
 struct hybris_bc_transfer_pool {
     VkDescriptorPool handle;
     uint32_t used;
@@ -157,6 +173,15 @@ static VkResult decode(struct hybris_bc_transfer *t, VkCommandBuffer command,
                 VkDescriptorSet set;
                 result = descriptors(t, &set);
                 if (result != VK_SUCCESS) return result;
+                int fast = fast_enabled() &&
+                    (uint64_t)extent.width * extent.height >= UINT64_C(1024) * 1024;
+                const char *trace = getauxval(AT_SECURE) ? NULL : getenv("HYBRIS_VULKAN_TRACE");
+                if (trace && !strcmp(trace, "1"))
+                    fprintf(stderr,
+                        "HYBRIS_BC_UPLOAD image=%p format=%u decoded=%u mip=%u "
+                        "x=%u y=%u width=%u height=%u layer=%u fast=%d\n",
+                        (void *)image->image, image->format, image->decoded_format,
+                        mip, x, y, width, height, first_slice + layer, fast);
                 VkDescriptorBufferInfo buffers[2] = {
                     {.buffer = image->blocks, .offset = base, .range = range},
                     {.buffer = t->scratch, .range = ((VkDeviceSize)width + 3) / 4 * ((height + UINT64_C(3)) / 4) * block_bytes}};
@@ -175,7 +200,7 @@ static VkResult decode(struct hybris_bc_transfer *t, VkCommandBuffer command,
                 buffer_barrier(t, command, t->scratch, VK_PIPELINE_STAGE_TRANSFER_BIT,
                     VK_ACCESS_TRANSFER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT);
                 struct hybris_bc_region decoding = {.format = image->format, .output_format = image->decoded_format,
-                    .fast = (uint64_t)extent.width * extent.height >= UINT64_C(1024) * 1024,
+                    .fast = fast,
                     .rgb16 = image->decoded_format == VK_FORMAT_R16G16B16_SFLOAT,
                     .rgb8 = image->decoded_format == VK_FORMAT_R8G8B8_UNORM || image->decoded_format == VK_FORMAT_R8G8B8_SRGB,
                     .width = width, .height = height, .layers = 1,

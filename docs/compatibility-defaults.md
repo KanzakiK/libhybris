@@ -10,6 +10,7 @@ Native format support takes precedence; forced emulation remains opt-in.
 | HYBRIS_VULKAN_COMPAT_PACKED_VERTEX | Missing-format conversion | 0 |
 | HYBRIS_BC_TEXTURES | missing | 0 |
 | HYBRIS_BC_TRANSCODE | Native ETC2/EAC/ASTC for eligible sampled BC images | 0 |
+| HYBRIS_BC_FAST | 1; fast encoder for images of 1024x1024 texels or more | 0 |
 | HYBRIS_VULKAN_COMPAT_UNUSED_BUILTINS | 1 | 0 |
 | HYBRIS_VULKAN_COMPAT_POINT_SIZE | 1 | 0 |
 | HYBRIS_VULKAN_COMPAT_INOUT | 1 | 0 |
@@ -21,7 +22,9 @@ The format/shader switches above remain disabled during secure execution. Existi
 secure-execution behavior for vertex stores and the Mali loader quirk is
 unchanged. Capability checks, shader eligibility checks and driver guards
 remain in place. Debug logging, dumps, validation and the `force` values
-are not enabled by this policy.
+are not enabled by this policy. `HYBRIS_VULKAN_TRACE=1` is observer-only
+diagnostics. `HYBRIS_BC_FAST=0` keeps the eligible transcode path enabled but
+forces the normal-quality encoder; it does not change Vulkan capabilities.
 
 Default enablement is not a conformance claim. The former image-bounds rewrite
 was removed: proximity to an image instruction does not prove that a conditional
